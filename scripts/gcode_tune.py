@@ -11,6 +11,7 @@ from gcode_emit import (
     pp_layer_retract,
     pp_seam_end,
     pp_seam_retract,
+    pp_seam_deretract,
     pp_z_hop,
 )
 from gcode_features import preserves_geometry
@@ -155,8 +156,11 @@ def recent_retract(out: list[str], window: int = 8, *, seam: bool = False) -> bo
     return False
 
 
-def seam_end_line(profile: E5S1Profile) -> str:
-    return pp_seam_end(profile["seam_extra_retract"], profile["retract_f"])
+def seam_end_line(profile: E5S1Profile) -> list[str]:
+    lines = []
+    lines.append(pp_seam_end(profile["seam_extra_retract"], profile["retract_f"]))
+    lines.append(pp_seam_deretract(profile["seam_extra_retract"], profile["retract_f"]))
+    return lines
 
 
 def apply_seam_block_start(
@@ -172,7 +176,8 @@ def apply_seam_block_start(
         out.append(pp_seam_retract(profile["seam_extra_retract"], profile["retract_f"]))
         actions.append("seam_retract")
     flow_seam = join_slow = False
-    if feat == "external":
+    # Apply to both external AND perimeter for better loop closure on small shapes!
+    if feat in ("external", "perimeter"):
         out.append(pp_flow_seam(profile["seam_flow_pct"]))
         actions.append("seam_flow")
         flow_seam = join_slow = True

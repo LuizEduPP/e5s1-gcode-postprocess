@@ -177,7 +177,8 @@ def transform_gcode(
         nonlocal flow_seam, seam_join_slow
         if surface_kind not in ("external", "perimeter"):
             return
-        out.append(seam_end_line(profile))
+        for line in seam_end_line(profile):
+            out.append(line)
         actions.append("seam_end")
         if flow_seam:
             out.append(pp_flow_reset())

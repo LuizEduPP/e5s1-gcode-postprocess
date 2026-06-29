@@ -41,6 +41,9 @@ def pp_seam_retract(mm: float, retract_f: int) -> str:
 def pp_seam_end(mm: float, retract_f: int) -> str:
     return f"G1 E-{mm} F{retract_f} ; postprocess seam end"
 
+def pp_seam_deretract(mm: float, retract_f: int) -> str:
+    return f"G1 E{mm} F{retract_f} ; postprocess seam deretract"
+
 
 def pp_homing() -> str:
     return "G28 ; postprocess homing"
