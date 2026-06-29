@@ -1,4 +1,4 @@
-"""E5S1 profile using bundle.ini with auto-initialization and update."""
+"""E5S1 profile — autonomous defaults with optional Prusa export overrides."""
 from __future__ import annotations
 
 import os
@@ -14,54 +14,63 @@ from config import (
 )
 from bundle_config import BundleConfig, get_bundle_config
 
-# Default values (fallback if no config exists)
-_DEFAULTS: dict[str, Any] = {
-    "nozzle_diameter": 0.8,
-    "pp_wall_speed_mm_s": 28,
-    "pp_infill_speed_mm_s": 50,
-    "pp_cap_speed_mm_s": 22,
-    "pp_default_speed_mm_s": 38,
-    "retract_length": 1.2,
-    "retract_speed": 50.0,
-    "retract_lift": 0.6,
-    "disable_fan_first_layers": 2,
-    "full_fan_speed_layer": 6,
-    "min_fan_speed": 65,
-    "max_fan_speed": 100,
-    "bridge_fan_speed": 100,
-    "bridge_flow_ratio": 0.92,
-    "first_layer_speed": 18.0,
-    "max_print_speed": 200.0,
-    "first_layer_acceleration": 600,
-    "default_acceleration": 1500,
-    "first_layer_height": 0.24,
-    "first_layer_temperature": 210,
-    "cap_extrusion_layers": 4,
-    "first_layer_motion_layers": 4,
-    "flow_ramp": "100,90,94,97,100",
-    "seam_extra_retract": 0.6,
-    "seam_flow_pct": 94,
-    "seam_fan_pct": 80,
-    "seam_join_speed": 15.0,
-    "overhang_fan_pct": 85,
-    "top_fan_pct": 70,
-    "ironing_fan_pct": 30,
-    "interface_fan_pct": 75,
-    "support_fan_pct": 75,
-    "pa_k": 0.06,
-    "skirts": 3,
-    "min_skirt_length": 40.0,
-    "pp_skirt_origin_x": 3.0,
-    "pp_skirt_origin_y": 3.0,
-    "pp_skirt_loop_offset_mm": 2.0,
-    "pp_skirt_extrusion_mm_per_mm": 0.1,
-}
-
 _CUSTOM_PARAM_KEYS = (
     "custom_parameters_print",
     "custom_parameters_filament",
     "custom_parameters_printer",
 )
+
+_NOZZLE_DIAMETER_MM = 0.8
+_NOZZLE_WALL_MM_S = 30
+_NOZZLE_INFILL_MM_S = 55
+_NOZZLE_CAP_MM_S = 25
+_NOZZLE_DEFAULT_MM_S = 40
+
+_RETRACT_LENGTH_MM = 0.8
+_RETRACT_SPEED_MM_S = 45.0
+_RETRACT_LIFT_MM = 0.4
+
+_FAN_OFF_LAYERS = 2
+_FAN_RAMP_LAYERS = 2
+_MIN_FAN_PCT = 70
+_MAX_FAN_PCT = 100
+_BRIDGE_FAN_PCT = 100
+
+_BRIDGE_FLOW_PCT = 95
+_FIRST_LAYER_SPEED_MM_S = 20.0
+_MAX_PRINT_SPEED_MM_S = 250.0
+_FIRST_LAYER_ACCEL = 500
+_DEFAULT_ACCEL = 2000
+_FIRST_LAYER_HEIGHT_MM = 0.24
+_FIRST_LAYER_TEMPERATURE_C = "215"
+
+_CAP_EXTRUSION_LAYERS = 3
+_FIRST_LAYER_MOTION_LAYERS = 3
+_FLOW_RAMP = (100, 88, 92, 96)
+
+_SEAM_EXTRA_RETRACT_MM = 0.4
+_SEAM_FLOW_PCT = 96
+_SEAM_FAN_PCT = 85
+_SEAM_JOIN_SPEED_MM_S = 18.0
+
+_OVERHANG_FAN_PCT = 86
+_TOP_FAN_PCT = 71
+_IRONING_FAN_PCT = 35
+_INTERFACE_FAN_PCT = 78
+_SUPPORT_FAN_PCT = 78
+
+_PA_K = 0.08
+
+_SKIRT_LOOPS = 3
+_SKIRT_SIDE_MM = 40.0
+_SKIRT_ORIGIN_X_MM = 3.0
+_SKIRT_ORIGIN_Y_MM = 3.0
+_SKIRT_LOOP_OFFSET_MM = 2.0
+_SKIRT_EXTRUSION_MM_PER_MM = 0.1
+
+
+class ProfileConfigError(ValueError):
+    pass
 
 
 class E5S1Profile(TypedDict):
@@ -158,6 +167,79 @@ def _merge_custom_parameters(cfg: dict[str, str]) -> dict[str, str]:
     return merged
 
 
+def _cfg_float(cfg: dict[str, str], key: str, default: float) -> float:
+    raw = cfg.get(key, "").strip()
+    if not raw or raw.lower() == "nil":
+        return default
+    try:
+        return float(raw.replace(",", ".").rstrip("%"))
+    except ValueError as exc:
+        raise ProfileConfigError(f"Invalid float for config key: {key}") from exc
+
+
+def _cfg_int(cfg: dict[str, str], key: str, default: int) -> int:
+    raw = cfg.get(key, "").strip()
+    if not raw or raw.lower() == "nil":
+        return default
+    try:
+        return int(float(raw.replace(",", ".")))
+    except ValueError as exc:
+        raise ProfileConfigError(f"Invalid integer for config key: {key}") from exc
+
+
+def _cfg_speed_f(cfg: dict[str, str], key: str, default_mm_s: float) -> int:
+    raw = cfg.get(key, "").strip()
+    if not raw or raw.lower() == "nil":
+        return int(default_mm_s * 60)
+    speed_mm_s = float(raw.replace(",", "."))
+    if speed_mm_s <= 0:
+        return int(default_mm_s * 60)
+    return int(speed_mm_s * 60)
+
+
+def _cfg_optional_speed_f(cfg: dict[str, str], key: str) -> int | None:
+    raw = cfg.get(key, "").strip()
+    if not raw or raw.lower() == "nil":
+        return None
+    speed_mm_s = float(raw.replace(",", "."))
+    if speed_mm_s <= 0:
+        return None
+    return int(speed_mm_s * 60)
+
+
+def _cfg_pct_pwm(cfg: dict[str, str], key: str, default_pct: int) -> int:
+    return pct_to_pwm(_cfg_int(cfg, key, default_pct))
+
+
+def _cfg_flow_ramp(cfg: dict[str, str], default: tuple[int, ...]) -> list[int]:
+    raw = cfg.get("flow_ramp", "").strip()
+    if not raw:
+        return list(default)
+    try:
+        return [int(x.strip()) for x in raw.split(",") if x.strip()]
+    except ValueError as exc:
+        raise ProfileConfigError("Invalid flow_ramp value") from exc
+
+
+def _nozzle_diameter_mm(cfg: dict[str, str]) -> float:
+    return _cfg_float(cfg, "nozzle_diameter", _NOZZLE_DIAMETER_MM)
+
+
+def _nozzle_speed_caps(cfg: dict[str, str]) -> tuple[int, int, int, int]:
+    nozzle_diameter_mm = _nozzle_diameter_mm(cfg)
+    wall_early_f = _cfg_optional_speed_f(cfg, "pp_wall_speed_mm_s")
+    if wall_early_f is None:
+        wall_early_f = int(nozzle_diameter_mm * _NOZZLE_WALL_MM_S * 60)
+    max_infill_f = _cfg_optional_speed_f(cfg, "pp_infill_speed_mm_s")
+    if max_infill_f is None:
+        max_infill_f = int(nozzle_diameter_mm * _NOZZLE_INFILL_MM_S * 60)
+    cap_extrusion_f = _cfg_optional_speed_f(cfg, "pp_cap_speed_mm_s")
+    if cap_extrusion_f is None:
+        cap_extrusion_f = int(nozzle_diameter_mm * _NOZZLE_CAP_MM_S * 60)
+    default_motion_f = int(nozzle_diameter_mm * _NOZZLE_DEFAULT_MM_S * 60)
+    return wall_early_f, max_infill_f, cap_extrusion_f, default_motion_f
+
+
 def parse_prusa_config(text: str) -> dict[str, str]:
     tail = text[-PRUSA_CONFIG_SCAN_BYTES:] if len(text) > PRUSA_CONFIG_SCAN_BYTES else text
     begin = tail.rfind(PRUSA_CONFIG_BEGIN)
@@ -181,117 +263,122 @@ def parse_prusa_config(text: str) -> dict[str, str]:
 
 
 def _init_bundle_defaults(bundle: BundleConfig, prusa_cfg: dict[str, str]) -> None:
-    """Initialize bundle.ini with defaults and prusa-derived config (auto-save)."""
-    section_order = ["print", "filament", "printer", "defaults"]
-    section_to_use = section_order[0]
-
-    # Use prusa config first, then defaults, then set in bundle.ini if missing
-    for key, default in _DEFAULTS.items():
+    # First, sync known keys from prusa_cfg if not already set in bundle
+    for key, val in prusa_cfg.items():
         if not bundle.has(key):
-            # Check if prusa has this key
-            if key in prusa_cfg:
-                bundle.set(key, prusa_cfg[key], section_to_use)
-            else:
-                bundle.set(key, default, "defaults")
+            bundle.set(key, val)
+
+    # Now set our E5S1 defaults if not set
+    defaults: dict[str, Any] = {
+        "nozzle_diameter": _NOZZLE_DIAMETER_MM,
+        "retract_length": _RETRACT_LENGTH_MM,
+        "retract_speed": _RETRACT_SPEED_MM_S,
+        "retract_lift": _RETRACT_LIFT_MM,
+        "disable_fan_first_layers": _FAN_OFF_LAYERS,
+        "full_fan_speed_layer": _FAN_OFF_LAYERS + _FAN_RAMP_LAYERS + 1,
+        "min_fan_speed": _MIN_FAN_PCT,
+        "max_fan_speed": _MAX_FAN_PCT,
+        "bridge_fan_speed": _BRIDGE_FAN_PCT,
+        "bridge_flow_ratio": _BRIDGE_FLOW_PCT / 100,
+        "overhang_fan_pct": _OVERHANG_FAN_PCT,
+        "top_fan_pct": _TOP_FAN_PCT,
+        "ironing_fan_pct": _IRONING_FAN_PCT,
+        "interface_fan_pct": _INTERFACE_FAN_PCT,
+        "support_fan_pct": _SUPPORT_FAN_PCT,
+        "seam_extra_retract": _SEAM_EXTRA_RETRACT_MM,
+        "seam_flow_pct": _SEAM_FLOW_PCT,
+        "seam_fan_pwm": _SEAM_FAN_PCT,
+        "seam_join_speed": _SEAM_JOIN_SPEED_MM_S,
+        "first_layer_speed": _FIRST_LAYER_SPEED_MM_S,
+        "pp_wall_speed_mm_s": None,
+        "pp_infill_speed_mm_s": None,
+        "pp_cap_speed_mm_s": None,
+        "max_print_speed": _MAX_PRINT_SPEED_MM_S,
+        "first_layer_acceleration": _FIRST_LAYER_ACCEL,
+        "default_acceleration": _DEFAULT_ACCEL,
+        "pa_k": _PA_K,
+        "flow_ramp": ",".join(map(str, _FLOW_RAMP)),
+        "cap_extrusion_layers": _CAP_EXTRUSION_LAYERS,
+        "first_layer_motion_layers": _FIRST_LAYER_MOTION_LAYERS,
+        "skirts": _SKIRT_LOOPS,
+        "min_skirt_length": _SKIRT_SIDE_MM,
+        "pp_skirt_origin_x": _SKIRT_ORIGIN_X_MM,
+        "pp_skirt_origin_y": _SKIRT_ORIGIN_Y_MM,
+        "pp_skirt_loop_offset_mm": _SKIRT_LOOP_OFFSET_MM,
+        "pp_skirt_extrusion_mm_per_mm": _SKIRT_EXTRUSION_MM_PER_MM,
+        "first_layer_height": _FIRST_LAYER_HEIGHT_MM,
+        "first_layer_temperature": int(_FIRST_LAYER_TEMPERATURE_C),
+    }
+
+    for key, val in defaults.items():
+        if not bundle.has(key):
+            bundle.set(key, val)
 
 
-def build_e5s1_profile(
-    prusa_cfg: dict[str, str] | None = None,
-    bundle: BundleConfig | None = None,
-) -> E5S1Profile:
-    """Build config, auto-initializing bundle.ini with defaults if needed."""
+def build_e5s1_profile(prusa_cfg: dict[str, str] | None = None, bundle: BundleConfig | None = None) -> E5S1Profile:
     prusa_cfg = _merge_custom_parameters(prusa_cfg or {})
-    bundle = bundle or get_bundle_config()
+    if bundle is None:
+        bundle = get_bundle_config()
 
-    # Initialize bundle if needed
+    # Initialize bundle with defaults (if not already present)
     _init_bundle_defaults(bundle, prusa_cfg)
 
-    # Section priority: prusa config > print > filament > printer > defaults
-    section_order: list[str] = []
-    for prefix in ("printer:", "filament:", "print:"):
-        section_order.extend([s for s in bundle.sections if s.startswith(prefix)])
-    section_order.extend([s for s in bundle.sections if not any(s.startswith(p) for p in ("printer:", "filament:", "print:"))])
-    section_order.append("defaults")
+    # Create cfg from bundle and prusa_cfg (bundle overrides prusa_cfg, which overrides our defaults)
+    cfg: dict[str, str] = {}
+    for key in bundle.sections:
+        # Get all keys in all sections
+        pass  # bundle doesn't expose all keys in all sections, so we'll use section priority
+    for key, val in prusa_cfg.items():
+        if not bundle.has(key):
+            cfg[key] = val
 
-    # Helper to get value from prusa config first, then bundle, then default
-    def get_val(key: str, default: Any = None, to_int: bool = False, to_float: bool = False) -> Any:
-        if key in prusa_cfg:
-            raw = prusa_cfg[key]
-            try:
-                if to_int:
-                    return int(float(raw))
-                if to_float:
-                    return float(raw)
-                return raw
-            except ValueError:
-                pass
-        return bundle.get(
-            key,
-            default,
-            section_priority=section_order,
-            converter=lambda x: int(float(x)) if to_int else (float(x) if to_float else x),
-        )
-
-    nozzle_diameter = get_val("nozzle_diameter", _DEFAULTS["nozzle_diameter"], to_float=True)
-    bridge_ratio = get_val("bridge_flow_ratio", _DEFAULTS["bridge_flow_ratio"], to_float=True)
+    fan_off = bundle.get("disable_fan_first_layers", _FAN_OFF_LAYERS, converter=int)
+    full_fan = bundle.get("full_fan_speed_layer", fan_off + _FAN_RAMP_LAYERS + 1, converter=int)
+    bridge_ratio = bundle.get("bridge_flow_ratio", _BRIDGE_FLOW_PCT / 100, converter=float)
     bridge_flow_pct = int(bridge_ratio * 100) if bridge_ratio <= 1 else int(bridge_ratio)
-
-    # Calculate speed caps
-    wall_early_f_raw = get_val("pp_wall_speed_mm_s", _DEFAULTS["pp_wall_speed_mm_s"], to_float=True)
-    max_infill_f_raw = get_val("pp_infill_speed_mm_s", _DEFAULTS["pp_infill_speed_mm_s"], to_float=True)
-    cap_extrusion_f_raw = get_val("pp_cap_speed_mm_s", _DEFAULTS["pp_cap_speed_mm_s"], to_float=True)
-    default_motion_f_raw = get_val("pp_default_speed_mm_s", _DEFAULTS["pp_default_speed_mm_s"], to_float=True)
-
-    wall_early_f = int(nozzle_diameter * wall_early_f_raw * 60)
-    max_infill_f = int(nozzle_diameter * max_infill_f_raw * 60)
-    cap_extrusion_f = int(nozzle_diameter * cap_extrusion_f_raw * 60)
-    default_motion_f = int(nozzle_diameter * default_motion_f_raw * 60)
-
-    # Parse flow ramp
-    flow_ramp_str = get_val("flow_ramp", _DEFAULTS["flow_ramp"])
-    try:
-        flow_ramp = [int(x.strip()) for x in str(flow_ramp_str).split(",") if x.strip()]
-    except Exception:
-        flow_ramp = [100, 90, 94, 97, 100]
-
-    # Build and return profile
+    wall_early_f, max_infill_f, cap_extrusion_f, default_motion_f = _nozzle_speed_caps({
+        "nozzle_diameter": str(bundle.get("nozzle_diameter", _NOZZLE_DIAMETER_MM)),
+        "pp_wall_speed_mm_s": str(bundle.get("pp_wall_speed_mm_s", "")),
+        "pp_infill_speed_mm_s": str(bundle.get("pp_infill_speed_mm_s", "")),
+        "pp_cap_speed_mm_s": str(bundle.get("pp_cap_speed_mm_s", "")),
+    })
     return {
-        "retract_mm": get_val("retract_length", _DEFAULTS["retract_length"], to_float=True),
-        "retract_f": int(get_val("retract_speed", _DEFAULTS["retract_speed"], to_float=True) * 60),
-        "retract_lift": get_val("retract_lift", _DEFAULTS["retract_lift"], to_float=True),
-        "fan_off_layers": get_val("disable_fan_first_layers", _DEFAULTS["disable_fan_first_layers"], to_int=True),
-        "full_fan_layer": get_val("full_fan_speed_layer", _DEFAULTS["full_fan_speed_layer"], to_int=True),
-        "min_fan_pwm": pct_to_pwm(get_val("min_fan_speed", _DEFAULTS["min_fan_speed"], to_int=True)),
-        "max_fan_pwm": pct_to_pwm(get_val("max_fan_speed", _DEFAULTS["max_fan_speed"], to_int=True)),
-        "bridge_fan_pwm": pct_to_pwm(get_val("bridge_fan_speed", _DEFAULTS["bridge_fan_speed"], to_int=True)),
+        "retract_mm": bundle.get("retract_length", _RETRACT_LENGTH_MM, converter=float),
+        "retract_f": int(bundle.get("retract_speed", _RETRACT_SPEED_MM_S, converter=float) * 60),
+        "retract_lift": bundle.get("retract_lift", _RETRACT_LIFT_MM, converter=float),
+        "fan_off_layers": fan_off,
+        "full_fan_layer": full_fan,
+        "min_fan_pwm": pct_to_pwm(bundle.get("min_fan_speed", _MIN_FAN_PCT, converter=int)),
+        "max_fan_pwm": pct_to_pwm(bundle.get("max_fan_speed", _MAX_FAN_PCT, converter=int)),
+        "bridge_fan_pwm": pct_to_pwm(bundle.get("bridge_fan_speed", _BRIDGE_FAN_PCT, converter=int)),
         "bridge_flow_pct": bridge_flow_pct,
-        "overhang_fan_pwm": pct_to_pwm(get_val("overhang_fan_pct", _DEFAULTS["overhang_fan_pct"], to_int=True)),
-        "top_fan_pwm": pct_to_pwm(get_val("top_fan_pct", _DEFAULTS["top_fan_pct"], to_int=True)),
-        "ironing_fan_pwm": pct_to_pwm(get_val("ironing_fan_pct", _DEFAULTS["ironing_fan_pct"], to_int=True)),
-        "interface_fan_pwm": pct_to_pwm(get_val("interface_fan_pct", _DEFAULTS["interface_fan_pct"], to_int=True)),
-        "support_fan_pwm": pct_to_pwm(get_val("support_fan_pct", _DEFAULTS["support_fan_pct"], to_int=True)),
-        "seam_extra_retract": get_val("seam_extra_retract", _DEFAULTS["seam_extra_retract"], to_float=True),
-        "seam_flow_pct": get_val("seam_flow_pct", _DEFAULTS["seam_flow_pct"], to_int=True),
-        "seam_fan_pwm": pct_to_pwm(get_val("seam_fan_pct", _DEFAULTS["seam_fan_pct"], to_int=True)),
-        "seam_join_f": int(get_val("seam_join_speed", _DEFAULTS["seam_join_speed"], to_float=True) * 60),
-        "first_layer_f": int(get_val("first_layer_speed", _DEFAULTS["first_layer_speed"], to_float=True) * 60),
+        "overhang_fan_pwm": pct_to_pwm(bundle.get("overhang_fan_pct", _OVERHANG_FAN_PCT, converter=int)),
+        "top_fan_pwm": pct_to_pwm(bundle.get("top_fan_pct", _TOP_FAN_PCT, converter=int)),
+        "ironing_fan_pwm": pct_to_pwm(bundle.get("ironing_fan_pct", _IRONING_FAN_PCT, converter=int)),
+        "interface_fan_pwm": pct_to_pwm(bundle.get("interface_fan_pct", _INTERFACE_FAN_PCT, converter=int)),
+        "support_fan_pwm": pct_to_pwm(bundle.get("support_fan_pct", _SUPPORT_FAN_PCT, converter=int)),
+        "seam_extra_retract": bundle.get("seam_extra_retract", _SEAM_EXTRA_RETRACT_MM, converter=float),
+        "seam_flow_pct": bundle.get("seam_flow_pct", _SEAM_FLOW_PCT, converter=int),
+        "seam_fan_pwm": pct_to_pwm(bundle.get("seam_fan_pwm", _SEAM_FAN_PCT, converter=int)),
+        "seam_join_f": int(bundle.get("seam_join_speed", _SEAM_JOIN_SPEED_MM_S, converter=float) * 60),
+        "first_layer_f": int(bundle.get("first_layer_speed", _FIRST_LAYER_SPEED_MM_S, converter=float) * 60),
         "wall_early_f": wall_early_f,
         "max_infill_f": max_infill_f,
         "cap_extrusion_f": cap_extrusion_f,
-        "max_print_f": int(get_val("max_print_speed", _DEFAULTS["max_print_speed"], to_float=True) * 60),
+        "max_print_f": int(bundle.get("max_print_speed", _MAX_PRINT_SPEED_MM_S, converter=float) * 60),
         "default_motion_f": default_motion_f,
-        "first_layer_accel": get_val("first_layer_acceleration", _DEFAULTS["first_layer_acceleration"], to_int=True),
-        "default_accel": get_val("default_acceleration", _DEFAULTS["default_acceleration"], to_int=True),
-        "pa_k": get_val("pa_k", _DEFAULTS["pa_k"], to_float=True),
-        "flow_ramp": flow_ramp,
-        "cap_extrusion_layers": get_val("cap_extrusion_layers", _DEFAULTS["cap_extrusion_layers"], to_int=True),
-        "first_layer_motion_layers": get_val("first_layer_motion_layers", _DEFAULTS["first_layer_motion_layers"], to_int=True),
-        "skirt_loops": get_val("skirts", _DEFAULTS["skirts"], to_int=True),
-        "skirt_side_mm": get_val("min_skirt_length", _DEFAULTS["min_skirt_length"], to_float=True),
-        "skirt_origin_x_mm": get_val("pp_skirt_origin_x", _DEFAULTS["pp_skirt_origin_x"], to_float=True),
-        "skirt_origin_y_mm": get_val("pp_skirt_origin_y", _DEFAULTS["pp_skirt_origin_y"], to_float=True),
-        "skirt_loop_offset_mm": get_val("pp_skirt_loop_offset_mm", _DEFAULTS["pp_skirt_loop_offset_mm"], to_float=True),
-        "skirt_extrusion_mm_per_mm": get_val("pp_skirt_extrusion_mm_per_mm", _DEFAULTS["pp_skirt_extrusion_mm_per_mm"], to_float=True),
-        "first_layer_height_mm": get_val("first_layer_height", _DEFAULTS["first_layer_height"], to_float=True),
-        "first_layer_temperature_c": str(get_val("first_layer_temperature", _DEFAULTS["first_layer_temperature"], to_int=True)),
+        "first_layer_accel": bundle.get("first_layer_acceleration", _FIRST_LAYER_ACCEL, converter=int),
+        "default_accel": bundle.get("default_acceleration", _DEFAULT_ACCEL, converter=int),
+        "pa_k": bundle.get("pa_k", _PA_K, converter=float),
+        "flow_ramp": _cfg_flow_ramp({"flow_ramp": bundle.get("flow_ramp", ",".join(map(str, _FLOW_RAMP)))}, _FLOW_RAMP),
+        "cap_extrusion_layers": bundle.get("cap_extrusion_layers", _CAP_EXTRUSION_LAYERS, converter=int),
+        "first_layer_motion_layers": bundle.get("first_layer_motion_layers", _FIRST_LAYER_MOTION_LAYERS, converter=int),
+        "skirt_loops": bundle.get("skirts", _SKIRT_LOOPS, converter=int),
+        "skirt_side_mm": bundle.get("min_skirt_length", _SKIRT_SIDE_MM, converter=float),
+        "skirt_origin_x_mm": bundle.get("pp_skirt_origin_x", _SKIRT_ORIGIN_X_MM, converter=float),
+        "skirt_origin_y_mm": bundle.get("pp_skirt_origin_y", _SKIRT_ORIGIN_Y_MM, converter=float),
+        "skirt_loop_offset_mm": bundle.get("pp_skirt_loop_offset_mm", _SKIRT_LOOP_OFFSET_MM, converter=float),
+        "skirt_extrusion_mm_per_mm": bundle.get("pp_skirt_extrusion_mm_per_mm", _SKIRT_EXTRUSION_MM_PER_MM, converter=float),
+        "first_layer_height_mm": bundle.get("first_layer_height", _FIRST_LAYER_HEIGHT_MM, converter=float),
+        "first_layer_temperature_c": str(bundle.get("first_layer_temperature", int(_FIRST_LAYER_TEMPERATURE_C), converter=int)),
     }

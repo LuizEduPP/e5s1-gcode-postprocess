@@ -56,7 +56,7 @@ def head_index(lines: list[str]) -> int:
 
 def skirt_gcode(profile: E5S1Profile, z: float | None = None) -> list[str]:
     z_val = z if z is not None else profile["first_layer_height_mm"]
-    lines = [pp_skirt_comment()]
+    lines = [pp_skirt_comment(), pp_skirt_z(z_val)]
     for loop in range(profile["skirt_loops"]):
         offset_mm = loop * profile["skirt_loop_offset_mm"]
         x0 = profile["skirt_origin_x_mm"] + offset_mm
@@ -66,15 +66,14 @@ def skirt_gcode(profile: E5S1Profile, z: float | None = None) -> list[str]:
         segment_e = profile["skirt_side_mm"] * profile["skirt_extrusion_mm_per_mm"]
         lines.extend(
             [
-                pp_skirt_z(z_val),
                 pp_skirt_travel(x0, y0),
                 pp_skirt_extrude(x1, y0, segment_e),
                 pp_skirt_extrude(x1, y1, segment_e),
                 pp_skirt_extrude(x0, y1, segment_e),
                 pp_skirt_extrude(x0, y0, segment_e),
-                pp_skirt_reset_e(),
             ]
         )
+    lines.append(pp_skirt_reset_e())
     return lines
 
 
