@@ -33,13 +33,11 @@ from gcode_features import type_feature
 from gcode_repair import inject_pa, repair_gcode
 from gcode_tune import (
     apply_feature_fan_tune,
-    apply_seam_block_start,
     cap_f_line,
     fan_pwm_for_layer,
     layer_retract_lines,
     recent_retract,
     sanitize_startup_line,
-    seam_end_line,
     speed_cap_for,
 )
 from profile import E5S1Profile, build_e5s1_profile, resolve_pa_firmware
@@ -109,7 +107,7 @@ def _handle_type_feature(
     skip_fan_at: set[int],
     cool_boost: bool,
     profile: E5S1Profile,
-) -> tuple[str | None, bool, bool, bool, bool]:
+) -> tuple[str | None, bool, bool]:
     if cool_boost:
         _restore_layer_fan(out, actions, layer_fan_cap)
         cool_boost = False
@@ -117,13 +115,9 @@ def _handle_type_feature(
     boost_fan = feat in (
         "top", "ironing", "interface", "support", "bottom", "external", "perimeter", "brim", "bridge", "overhang"
     )
-    flow_seam = seam_join_slow = False
 
     if feat in ("external", "perimeter"):
         out.append(stripped)
-        flow_seam, seam_join_slow = apply_seam_block_start(
-            out, actions, feat, profile, layer_count
-        )
         if skip_idx := apply_feature_fan_tune(
             out, actions, feat, lines, idx,
             layer_count=layer_count,
@@ -131,7 +125,7 @@ def _handle_type_feature(
             profile=profile,
         ):
             skip_fan_at.add(skip_idx)
-        return feat, boost_fan, cool_boost, flow_seam, seam_join_slow
+        return feat, boost_fan, cool_boost
 
     tuned = {"top", "ironing", "interface", "support", "bottom", "brim"}
     if feat in tuned:
@@ -143,13 +137,13 @@ def _handle_type_feature(
             profile=profile,
         ):
             skip_fan_at.add(skip_idx)
-        return feat, boost_fan, cool_boost, False, False
+        return feat, boost_fan, cool_boost
 
     if feat == "other":
-        return None, False, cool_boost, False, False
+        return None, False, cool_boost
 
     out.append(stripped)
-    return feat, boost_fan, cool_boost, False, False
+    return feat, boost_fan, cool_boost
 
 
 def transform_gcode(
@@ -169,24 +163,9 @@ def transform_gcode(
     boost_fan = False
     cool_boost = False
     flow_bridge = False
-    flow_seam = False
-    seam_join_slow = False
     surface_kind: str | None = None
     last_f = profile["default_motion_f"]
     skip_fan_at: set[int] = set()
-
-    def _end_seam_block() -> None:
-        nonlocal flow_seam, seam_join_slow
-        if surface_kind not in ("external", "perimeter"):
-            return
-        for line in seam_end_line(profile):
-            out.append(line)
-        actions.append("seam_end")
-        if flow_seam:
-            out.append(pp_flow_reset())
-            actions.append("flow_reset")
-            flow_seam = False
-        seam_join_slow = False
 
     def _reset_flow() -> None:
         nonlocal flow_bridge
@@ -223,8 +202,6 @@ def transform_gcode(
 
         feat = type_feature(stripped)
         if feat in ("bridge", "overhang"):
-            if surface_kind in ("external", "perimeter"):
-                _end_seam_block()
             if cool_boost:
                 _restore_layer_fan(out, actions, layer_fan_cap)
             _reset_flow()
@@ -244,10 +221,8 @@ def transform_gcode(
             continue
 
         if feat is not None:
-            if surface_kind in ("external", "perimeter") and feat not in ("external", "perimeter"):
-                _end_seam_block()
             _reset_flow()
-            surface_kind, boost_fan, cool_boost, flow_seam, seam_join_slow = _handle_type_feature(
+            surface_kind, boost_fan, cool_boost = _handle_type_feature(
                 out, actions, feat, stripped, lines, i,
                 layer_count=layer_count,
                 layer_fan_cap=layer_fan_cap,
@@ -255,14 +230,6 @@ def transform_gcode(
                 cool_boost=cool_boost,
                 profile=profile,
             )
-            continue
-
-        if seam_join_slow and upper.startswith("G1") and " E" in upper and G1_EXTRUDE_RE.match(stripped):
-            new_line, capped, last_f = cap_f_line(stripped, profile["seam_join_f"], last_f)
-            out.append(new_line)
-            if capped:
-                actions.append("seam_join_slow")
-            seam_join_slow = False
             continue
 
         if surface_kind == "ironing" and fan_m and "postprocess" not in stripped.lower():
@@ -275,8 +242,6 @@ def transform_gcode(
             continue
 
         if LAYER_BEFORE_MARKER in stripped or AFTER_LAYER_MARKER in stripped:
-            if surface_kind in ("external", "perimeter"):
-                _end_seam_block()
             in_startup = False
             if cool_boost:
                 _restore_layer_fan(out, actions, layer_fan_cap)
@@ -287,16 +252,12 @@ def transform_gcode(
             boost_fan = False
             cool_boost = False
             surface_kind = None
-            flow_seam = False
-            seam_join_slow = False
             layer_count, layer_fan_cap = _begin_layer(out, actions, stripped, layer_count, profile)
             continue
 
         if LAYER_CHANGE_MARKER in stripped:
             in_startup = False
             if layer_count == 0:
-                if surface_kind in ("external", "perimeter"):
-                    _end_seam_block()
                 if cool_boost:
                     _restore_layer_fan(out, actions, layer_fan_cap)
                 _reset_flow()

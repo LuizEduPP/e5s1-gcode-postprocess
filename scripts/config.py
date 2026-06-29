@@ -34,8 +34,13 @@ LAYER_RETRACT = True
 M204_CAP_LAYERS = 3
 SUPPORT_OVERHANG_MIN = 1
 
-ENABLE_MESH_ON_START = "M420 S1 ; postprocess mesh"
-STARTUP_PURGE = "G1 X3 Y200 E20 F600 ; postprocess purge"
+ENABLE_MESH_ON_START = "M420 S1 Z10 ; postprocess mesh"
+STARTUP_PURGE = """G1 X2.0 Y20 F5000.0 ; postprocess purge
+G1 Z0.28 F1500.0 ; postprocess purge
+G1 X2.0 Y145.0 Z0.28 F1500.0 E15 ; postprocess purge
+G1 X2.3 Y145.0 Z0.28 F5000.0 ; postprocess purge
+G1 X2.3 Y20 Z0.28 F1500.0 E30 ; postprocess purge
+G92 E0 ; postprocess purge"""
 
 INVALID_MACRO_SNIPPET = "first_layer_height[0]"
 THUMBNAIL_BEGIN = "; thumbnail begin"

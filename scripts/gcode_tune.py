@@ -9,9 +9,6 @@ from gcode_emit import (
     pp_fan_seam,
     pp_flow_seam,
     pp_layer_retract,
-    pp_seam_end,
-    pp_seam_retract,
-    pp_seam_deretract,
     pp_z_hop,
 )
 from gcode_features import preserves_geometry
@@ -156,38 +153,8 @@ def recent_retract(out: list[str], window: int = 8, *, seam: bool = False) -> bo
     return False
 
 
-def seam_end_line(profile: E5S1Profile) -> list[str]:
-    lines = []
-    lines.append(pp_seam_end(profile["seam_extra_retract"], profile["retract_f"]))
-    lines.append(pp_seam_deretract(profile["seam_extra_retract"], profile["retract_f"]))
-    return lines
-
-
-def apply_seam_block_start(
-    out: list[str],
-    actions: list[str],
-    feat: str,
-    profile: E5S1Profile,
-    layer_count: int,
-) -> tuple[bool, bool]:
-    if feat not in ("external", "perimeter") or layer_count < 1:
-        return False, False
-    if not recent_retract(out, seam=True):
-        out.append(pp_seam_retract(profile["seam_extra_retract"], profile["retract_f"]))
-        actions.append("seam_retract")
-    flow_seam = join_slow = False
-    # Apply to both external AND perimeter for better loop closure on small shapes!
-    if feat in ("external", "perimeter"):
-        out.append(pp_flow_seam(profile["seam_flow_pct"]))
-        actions.append("seam_flow")
-        flow_seam = join_slow = True
-    return flow_seam, join_slow
-
-
 def sanitize_startup_line(line: str, first_layer_height_mm: float) -> tuple[str | None, str | None]:
     stripped = line.rstrip("\n\r")
-    if G29_RE.match(stripped.strip()):
-        return None, "g29_removed"
     if INVALID_MACRO_SNIPPET in stripped:
         return stripped.replace(INVALID_MACRO_SNIPPET, str(first_layer_height_mm)), "macro_fixed"
     return stripped, None

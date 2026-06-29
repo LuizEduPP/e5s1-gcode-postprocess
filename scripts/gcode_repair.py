@@ -102,8 +102,9 @@ def _line_index(lines: list[str], pattern: re.Pattern[str]) -> int | None:
 
 
 def _insert_after(lines: list[str], idx: int | None, line: str) -> None:
-    lines.insert((idx + 1) if idx is not None else _comment_prefix_len(lines), line)
-
+    insert_idx = (idx + 1) if idx is not None else _comment_prefix_len(lines)
+    for part in reversed(line.split("\n")):
+        lines.insert(insert_idx, part)
 
 def _insert_skirt_block(head: list[str], block: list[str]) -> list[str]:
     idx = len(head)
