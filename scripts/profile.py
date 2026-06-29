@@ -326,11 +326,29 @@ def build_e5s1_profile(prusa_cfg: dict[str, str] | None = None, bundle: BundleCo
     # Initialize bundle with defaults (if not already present)
     _init_bundle_defaults(bundle, prusa_cfg)
 
-    # Helper functions for common conversions
+    # Helper functions for common conversions prioritizing prusa_cfg
+    def get_str(key: str, default: str) -> str:
+        val = prusa_cfg.get(key)
+        if val is not None and val.lower() != "nil":
+            return val
+        return str(bundle.get(key, default))
+
     def get_int(key: str, default: int) -> int:
+        val = prusa_cfg.get(key)
+        if val is not None and val.lower() != "nil":
+            try:
+                return int(float(val.replace(",", ".")))
+            except ValueError:
+                pass
         return bundle.get(key, default, converter=int)
 
     def get_float(key: str, default: float) -> float:
+        val = prusa_cfg.get(key)
+        if val is not None and val.lower() != "nil":
+            try:
+                return float(val.replace(",", ".").rstrip("%"))
+            except ValueError:
+                pass
         return bundle.get(key, default, converter=float)
 
     def get_pwm(key: str, default_pct: int) -> int:
@@ -340,7 +358,7 @@ def build_e5s1_profile(prusa_cfg: dict[str, str] | None = None, bundle: BundleCo
         return int(get_float(key, default_mm_s) * 60)
 
     # Auto-detect filament type and nozzle diameter
-    filament_type = str(bundle.get("filament_type", prusa_cfg.get("filament_type", "PLA"))).upper()
+    filament_type = get_str("filament_type", "PLA").upper()
     nozzle_diameter = get_float("nozzle_diameter", _NOZZLE_DIAMETER_MM)
 
     # TPU specific speed and retraction adjustments
@@ -357,9 +375,9 @@ def build_e5s1_profile(prusa_cfg: dict[str, str] | None = None, bundle: BundleCo
 
     wall_early_f, max_infill_f, cap_extrusion_f, default_motion_f = _nozzle_speed_caps({
         "nozzle_diameter": str(nozzle_diameter),
-        "pp_wall_speed_mm_s": str(bundle.get("pp_wall_speed_mm_s", "")),
-        "pp_infill_speed_mm_s": str(bundle.get("pp_infill_speed_mm_s", "")),
-        "pp_cap_speed_mm_s": str(bundle.get("pp_cap_speed_mm_s", "")),
+        "pp_wall_speed_mm_s": get_str("pp_wall_speed_mm_s", ""),
+        "pp_infill_speed_mm_s": get_str("pp_infill_speed_mm_s", ""),
+        "pp_cap_speed_mm_s": get_str("pp_cap_speed_mm_s", ""),
     })
 
     # TPU specific speed cap overrides
@@ -370,18 +388,13 @@ def build_e5s1_profile(prusa_cfg: dict[str, str] | None = None, bundle: BundleCo
         default_motion_f = int(min(default_motion_f, TPU_MAX_SPEED_MM_S * 60))
 
     # Auto-calibrate PA K-value based on nozzle size and filament type if not overridden
-    user_pa = prusa_cfg.get("pa_k")
-    if user_pa is not None:
+    user_pa = get_str("pa_k", "")
+    if user_pa and user_pa != str(_PA_K) and user_pa != "0.06":
         try:
             pa_k = float(user_pa)
         except ValueError:
             pa_k = get_float("pa_k", _PA_K)
     else:
-        # Check if bundle has a custom pa_k (different from standard defaults)
-        bundle_pa = bundle.get("pa_k")
-        if bundle_pa is not None and bundle_pa != _PA_K and bundle_pa != 0.06:
-            pa_k = float(bundle_pa)
-        else:
             base_pa = 0.08 * (nozzle_diameter / 0.8)
             if "TPU" in filament_type or "FLEX" in filament_type:
                 pa_k = base_pa * TPU_PA_MULTIPLIER
