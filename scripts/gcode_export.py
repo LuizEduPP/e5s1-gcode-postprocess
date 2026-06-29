@@ -1,6 +1,7 @@
 """Recent export discovery for PrusaSlicer temp files."""
 from __future__ import annotations
 
+import abc
 import heapq
 import os
 import time
@@ -10,44 +11,54 @@ from config import MARKER, MARKER_HEAD_BYTES
 from profile import EXPORT_SEARCH_DIRS
 
 
-def _recent_gcode_candidates(folder: Path, now: float, max_age_s: int, max_files: int) -> list[Path]:
-    heap: list[tuple[float, int, Path]] = []
-    seq = 0
-    try:
-        with os.scandir(folder) as entries:
-            for entry in entries:
-                if not entry.is_file() or not entry.name.endswith(".gcode"):
-                    continue
+class IExportFinder(abc.ABC):
+    @abc.abstractmethod
+    def find_recent_export(self, max_age_s: int = 300, max_files: int = 5) -> Path | None:
+        pass
+
+
+class RecentExportFinder(IExportFinder):
+    def _recent_gcode_candidates(self, folder: Path, now: float, max_age_s: int, max_files: int) -> list[Path]:
+        heap: list[tuple[float, int, Path]] = []
+        seq = 0
+        try:
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if not entry.is_file() or not entry.name.endswith(".gcode"):
+                        continue
+                    try:
+                        mtime = entry.stat().st_mtime
+                    except OSError:
+                        continue
+                    if now - mtime > max_age_s:
+                        continue
+                    seq += 1
+                    item = (mtime, seq, Path(entry.path))
+                    if len(heap) < max_files:
+                        heapq.heappush(heap, item)
+                    elif mtime > heap[0][0]:
+                        heapq.heapreplace(heap, item)
+        except OSError:
+            return []
+        return [path for _, _, path in sorted(heap, key=lambda item: (-item[0], -item[1]))]
+
+    def find_recent_export(self, max_age_s: int = 300, max_files: int = 5) -> Path | None:
+        now = time.time()
+        for folder in EXPORT_SEARCH_DIRS:
+            if not folder.is_dir():
+                continue
+            for candidate in self._recent_gcode_candidates(folder, now, max_age_s, max_files):
                 try:
-                    mtime = entry.stat().st_mtime
+                    with candidate.open(encoding="utf-8", errors="replace") as f:
+                        if MARKER in f.read(MARKER_HEAD_BYTES):
+                            return candidate
                 except OSError:
                     continue
-                if now - mtime > max_age_s:
-                    continue
-                seq += 1
-                item = (mtime, seq, Path(entry.path))
-                if len(heap) < max_files:
-                    heapq.heappush(heap, item)
-                elif mtime > heap[0][0]:
-                    heapq.heapreplace(heap, item)
-    except OSError:
-        return []
-    return [path for _, _, path in sorted(heap, key=lambda item: (-item[0], -item[1]))]
+        return None
 
 
 def find_recent_export(max_age_s: int = 300, max_files: int = 5) -> Path | None:
-    now = time.time()
-    for folder in EXPORT_SEARCH_DIRS:
-        if not folder.is_dir():
-            continue
-        for candidate in _recent_gcode_candidates(folder, now, max_age_s, max_files):
-            try:
-                with candidate.open(encoding="utf-8", errors="replace") as f:
-                    if MARKER in f.read(MARKER_HEAD_BYTES):
-                        return candidate
-            except OSError:
-                continue
-    return None
+    return RecentExportFinder().find_recent_export(max_age_s, max_files)
 
 
 def path_note(path: Path, argv: list[str] | None = None, export: Path | None = None) -> str:

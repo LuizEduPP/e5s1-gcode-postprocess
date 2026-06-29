@@ -1,6 +1,7 @@
 """Dynamic config loader for bundle.ini (no hardcoded sections)."""
 from __future__ import annotations
 
+import abc
 import configparser
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,34 @@ def _auto_cast(value: str) -> Any:
             return value
 
 
-class BundleConfig:
+class IBundleConfig(abc.ABC):
+    @property
+    @abc.abstractmethod
+    def sections(self) -> list[str]:
+        pass
+
+    @abc.abstractmethod
+    def load(self) -> None:
+        pass
+
+    @abc.abstractmethod
+    def save(self, path: Path | str | None = None) -> None:
+        pass
+
+    @abc.abstractmethod
+    def get(self, key: str, default: Any = None, section_priority: list[str] | None = None, converter: Any = None) -> Any:
+        pass
+
+    @abc.abstractmethod
+    def has(self, key: str, section: str | None = None) -> bool:
+        pass
+
+    @abc.abstractmethod
+    def set(self, key: str, value: Any, section: str = "defaults", auto_save: bool = True) -> None:
+        pass
+
+
+class BundleConfig(IBundleConfig):
     def __init__(self, path: Path | str | None = None):
         self._config = configparser.ConfigParser(allow_no_value=True)
         self._config.optionxform = str  # Preserve case
@@ -115,13 +143,15 @@ class BundleConfig:
             self.save()
 
 
-# Singleton
-_bundle: BundleConfig | None = None
+class BundleConfigFactory:
+    _instance: IBundleConfig | None = None
+
+    @classmethod
+    def get_instance(cls) -> IBundleConfig:
+        if cls._instance is None:
+            cls._instance = BundleConfig()
+        return cls._instance
 
 
-def get_bundle_config() -> BundleConfig:
-    """Get or create the singleton BundleConfig instance."""
-    global _bundle
-    if _bundle is None:
-        _bundle = BundleConfig()
-    return _bundle
+def get_bundle_config() -> IBundleConfig:
+    return BundleConfigFactory.get_instance()

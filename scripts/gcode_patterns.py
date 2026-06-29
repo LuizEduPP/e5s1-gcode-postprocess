@@ -1,6 +1,7 @@
 """Shared G-code regex patterns and layer/skirt parsing helpers."""
 from __future__ import annotations
 
+import abc
 import re
 
 from config import (
@@ -46,51 +47,89 @@ PP_SUFFIX_RE = re.compile(
 )
 
 
+class IGCodePatternMatcher(abc.ABC):
+    @abc.abstractmethod
+    def count_layers(self, text: str, prusa_cfg: dict[str, str] | None = None) -> int:
+        pass
+
+    @abc.abstractmethod
+    def has_skirt_or_brim(self, text: str) -> tuple[bool, bool]:
+        pass
+
+    @abc.abstractmethod
+    def is_pp_line(self, line: str, *, pa_only: bool = False) -> bool:
+        pass
+
+    @abc.abstractmethod
+    def strip_pp_lines(self, lines: list[str], full: bool = False) -> list[str]:
+        pass
+
+
+class GCodePatternMatcher(IGCodePatternMatcher):
+    def count_layers(self, text: str, prusa_cfg: dict[str, str] | None = None) -> int:
+        before = text.count(LAYER_BEFORE_MARKER)
+        if before:
+            lc, bf = text.find(LAYER_CHANGE_MARKER), text.find(LAYER_BEFORE_MARKER)
+            return before + (1 if lc >= 0 and bf > lc else 0)
+        after = text.count(AFTER_LAYER_MARKER)
+        if after:
+            return after
+        layer_n = text.count(LAYER_N_MARKER)
+        if layer_n:
+            return layer_n
+        lc = text.count(LAYER_CHANGE_MARKER)
+        if lc:
+            return lc
+        if prusa_cfg is None:
+            from profile import parse_prusa_config
+            prusa_cfg = parse_prusa_config(text)
+        for key in ("total_layer_count", "num_layers"):
+            if key in prusa_cfg and prusa_cfg[key].isdigit():
+                return int(prusa_cfg[key])
+        return 0
+
+    def has_skirt_or_brim(self, text: str) -> tuple[bool, bool]:
+        low = text[:120000]
+        has_skirt = any(
+            tag in low
+            for tag in (TYPE_SKIRT, TYPE_SKIRT_BRIM, "; SKIRT", ";SKIRT", "; type:skirt")
+        )
+        has_brim = TYPE_BRIM in low or TYPE_OUTER_BRIM in low
+        return has_skirt, has_brim
+
+    def is_pp_line(self, line: str, *, pa_only: bool = False) -> bool:
+        stripped = line.strip()
+        is_pa = bool(
+            "postprocess" in line and (M900_RE.match(stripped) or PA_KLIPPER_RE.search(stripped))
+        )
+        if pa_only:
+            return is_pa
+        if is_pa or MARKER in line or stripped.startswith("; postprocessed:"):
+            return True
+        return bool(PP_SUFFIX_RE.search(stripped))
+
+    def strip_pp_lines(self, lines: list[str], full: bool = False) -> list[str]:
+        return [ln for ln in lines if not self.is_pp_line(ln, pa_only=not full)]
+
+
+class PatternMatcherFactory:
+    _instance: IGCodePatternMatcher | None = None
+
+    @classmethod
+    def get_instance(cls) -> IGCodePatternMatcher:
+        if cls._instance is None:
+            cls._instance = GCodePatternMatcher()
+        return cls._instance
+
+
 def count_layers(text: str, prusa_cfg: dict[str, str] | None = None) -> int:
-    before = text.count(LAYER_BEFORE_MARKER)
-    if before:
-        lc, bf = text.find(LAYER_CHANGE_MARKER), text.find(LAYER_BEFORE_MARKER)
-        return before + (1 if lc >= 0 and bf > lc else 0)
-    after = text.count(AFTER_LAYER_MARKER)
-    if after:
-        return after
-    layer_n = text.count(LAYER_N_MARKER)
-    if layer_n:
-        return layer_n
-    lc = text.count(LAYER_CHANGE_MARKER)
-    if lc:
-        return lc
-    if prusa_cfg is None:
-        from profile import parse_prusa_config
-
-        prusa_cfg = parse_prusa_config(text)
-    for key in ("total_layer_count", "num_layers"):
-        if key in prusa_cfg and prusa_cfg[key].isdigit():
-            return int(prusa_cfg[key])
-    return 0
-
+    return PatternMatcherFactory.get_instance().count_layers(text, prusa_cfg)
 
 def has_skirt_or_brim(text: str) -> tuple[bool, bool]:
-    low = text[:120000]
-    has_skirt = any(
-        tag in low
-        for tag in (TYPE_SKIRT, TYPE_SKIRT_BRIM, "; SKIRT", ";SKIRT", "; type:skirt")
-    )
-    has_brim = TYPE_BRIM in low or TYPE_OUTER_BRIM in low
-    return has_skirt, has_brim
-
+    return PatternMatcherFactory.get_instance().has_skirt_or_brim(text)
 
 def is_pp_line(line: str, *, pa_only: bool = False) -> bool:
-    stripped = line.strip()
-    is_pa = bool(
-        "postprocess" in line and (M900_RE.match(stripped) or PA_KLIPPER_RE.search(stripped))
-    )
-    if pa_only:
-        return is_pa
-    if is_pa or MARKER in line or stripped.startswith("; postprocessed:"):
-        return True
-    return bool(PP_SUFFIX_RE.search(stripped))
-
+    return PatternMatcherFactory.get_instance().is_pp_line(line, pa_only=pa_only)
 
 def strip_pp_lines(lines: list[str], full: bool = False) -> list[str]:
-    return [ln for ln in lines if not is_pp_line(ln, pa_only=not full)]
+    return PatternMatcherFactory.get_instance().strip_pp_lines(lines, full)
