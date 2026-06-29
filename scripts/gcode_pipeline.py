@@ -125,7 +125,7 @@ class PostProcessApp:
             raw = path.read_text(encoding="utf-8", errors="replace")
             hint = " ".join(str(p) for p in [path] if p)
 
-            if MARKER in raw and not force:
+            if self.analyzer.is_postprocessed(raw) and not force:
                 analysis = self.analyzer.analyze(raw, hint)
                 errors, warnings = self.validator.validate(raw, expect_postprocess=True, analysis=analysis)
                 self.logger.log_result(
