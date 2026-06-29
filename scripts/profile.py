@@ -11,6 +11,10 @@ from config import (
     PRUSA_CONFIG_BEGIN,
     PRUSA_CONFIG_END,
     PRUSA_CONFIG_SCAN_BYTES,
+    TPU_MAX_SPEED_MM_S,
+    TPU_SPEED_MULTIPLIER,
+    TPU_PA_MULTIPLIER,
+    PETG_PA_MULTIPLIER,
 )
 from bundle_config import BundleConfig, get_bundle_config
 
@@ -112,6 +116,8 @@ class E5S1Profile(TypedDict):
     skirt_extrusion_mm_per_mm: float
     first_layer_height_mm: float
     first_layer_temperature_c: str
+    nozzle_diameter_mm: float
+    filament_type: str
 
 
 def pct_to_pwm(pct: int) -> int:
@@ -333,20 +339,70 @@ def build_e5s1_profile(prusa_cfg: dict[str, str] | None = None, bundle: BundleCo
     def get_speed_f(key: str, default_mm_s: float) -> int:
         return int(get_float(key, default_mm_s) * 60)
 
+    # Auto-detect filament type and nozzle diameter
+    filament_type = str(bundle.get("filament_type", prusa_cfg.get("filament_type", "PLA"))).upper()
+    nozzle_diameter = get_float("nozzle_diameter", _NOZZLE_DIAMETER_MM)
+
+    # TPU specific speed and retraction adjustments
+    max_print_speed_val = get_float("max_print_speed", _MAX_PRINT_SPEED_MM_S)
+    retract_speed_val = get_float("retract_speed", _RETRACT_SPEED_MM_S)
+    if "TPU" in filament_type or "FLEX" in filament_type:
+        max_print_speed_val = min(max_print_speed_val, TPU_MAX_SPEED_MM_S)
+        retract_speed_val = retract_speed_val * TPU_SPEED_MULTIPLIER
+
     fan_off = get_int("disable_fan_first_layers", _FAN_OFF_LAYERS)
     full_fan = get_int("full_fan_speed_layer", fan_off + _FAN_RAMP_LAYERS + 1)
     bridge_ratio = get_float("bridge_flow_ratio", _BRIDGE_FLOW_PCT / 100)
     bridge_flow_pct = int(bridge_ratio * 100) if bridge_ratio <= 1 else int(bridge_ratio)
+
     wall_early_f, max_infill_f, cap_extrusion_f, default_motion_f = _nozzle_speed_caps({
-        "nozzle_diameter": str(get_float("nozzle_diameter", _NOZZLE_DIAMETER_MM)),
+        "nozzle_diameter": str(nozzle_diameter),
         "pp_wall_speed_mm_s": str(bundle.get("pp_wall_speed_mm_s", "")),
         "pp_infill_speed_mm_s": str(bundle.get("pp_infill_speed_mm_s", "")),
         "pp_cap_speed_mm_s": str(bundle.get("pp_cap_speed_mm_s", "")),
     })
 
+    # TPU specific speed cap overrides
+    if "TPU" in filament_type or "FLEX" in filament_type:
+        wall_early_f = int(min(wall_early_f, TPU_MAX_SPEED_MM_S * 60))
+        max_infill_f = int(min(max_infill_f, TPU_MAX_SPEED_MM_S * 60))
+        cap_extrusion_f = int(min(cap_extrusion_f, TPU_MAX_SPEED_MM_S * 60))
+        default_motion_f = int(min(default_motion_f, TPU_MAX_SPEED_MM_S * 60))
+
+    # Auto-calibrate PA K-value based on nozzle size and filament type if not overridden
+    user_pa = prusa_cfg.get("pa_k")
+    if user_pa is not None:
+        try:
+            pa_k = float(user_pa)
+        except ValueError:
+            pa_k = get_float("pa_k", _PA_K)
+    else:
+        # Check if bundle has a custom pa_k (different from standard defaults)
+        bundle_pa = bundle.get("pa_k")
+        if bundle_pa is not None and bundle_pa != _PA_K and bundle_pa != 0.06:
+            pa_k = float(bundle_pa)
+        else:
+            base_pa = 0.08 * (nozzle_diameter / 0.8)
+            if "TPU" in filament_type or "FLEX" in filament_type:
+                pa_k = base_pa * TPU_PA_MULTIPLIER
+            elif "PETG" in filament_type or "PET" in filament_type:
+                pa_k = base_pa * PETG_PA_MULTIPLIER
+            else:
+                pa_k = base_pa
+
+    # Dynamic flow ramp scaling based on nozzle size
+    if "flow_ramp" in prusa_cfg:
+        flow_ramp = _cfg_flow_ramp(prusa_cfg, _FLOW_RAMP)
+    else:
+        if nozzle_diameter < 0.6:
+            default_ramp = [100, 96, 98, 99, 100]
+        else:
+            default_ramp = list(_FLOW_RAMP)
+        flow_ramp = _cfg_flow_ramp({"flow_ramp": bundle.get("flow_ramp", ",".join(map(str, default_ramp)))}, tuple(default_ramp))
+
     return {
         "retract_mm": get_float("retract_length", _RETRACT_LENGTH_MM),
-        "retract_f": get_speed_f("retract_speed", _RETRACT_SPEED_MM_S),
+        "retract_f": int(retract_speed_val * 60),
         "retract_lift": get_float("retract_lift", _RETRACT_LIFT_MM),
         "fan_off_layers": fan_off,
         "full_fan_layer": full_fan,
@@ -367,12 +423,12 @@ def build_e5s1_profile(prusa_cfg: dict[str, str] | None = None, bundle: BundleCo
         "wall_early_f": wall_early_f,
         "max_infill_f": max_infill_f,
         "cap_extrusion_f": cap_extrusion_f,
-        "max_print_f": get_speed_f("max_print_speed", _MAX_PRINT_SPEED_MM_S),
+        "max_print_f": int(max_print_speed_val * 60),
         "default_motion_f": default_motion_f,
         "first_layer_accel": get_int("first_layer_acceleration", _FIRST_LAYER_ACCEL),
         "default_accel": get_int("default_acceleration", _DEFAULT_ACCEL),
-        "pa_k": get_float("pa_k", _PA_K),
-        "flow_ramp": _cfg_flow_ramp({"flow_ramp": bundle.get("flow_ramp", ",".join(map(str, _FLOW_RAMP)))}, _FLOW_RAMP),
+        "pa_k": pa_k,
+        "flow_ramp": flow_ramp,
         "cap_extrusion_layers": get_int("cap_extrusion_layers", _CAP_EXTRUSION_LAYERS),
         "first_layer_motion_layers": get_int("first_layer_motion_layers", _FIRST_LAYER_MOTION_LAYERS),
         "skirt_loops": get_int("skirts", _SKIRT_LOOPS),
@@ -383,4 +439,6 @@ def build_e5s1_profile(prusa_cfg: dict[str, str] | None = None, bundle: BundleCo
         "skirt_extrusion_mm_per_mm": get_float("pp_skirt_extrusion_mm_per_mm", _SKIRT_EXTRUSION_MM_PER_MM),
         "first_layer_height_mm": get_float("first_layer_height", _FIRST_LAYER_HEIGHT_MM),
         "first_layer_temperature_c": str(get_int("first_layer_temperature", int(_FIRST_LAYER_TEMPERATURE_C))),
+        "nozzle_diameter_mm": nozzle_diameter,
+        "filament_type": filament_type,
     }

@@ -80,3 +80,21 @@ PP_FAN_TAGS = (
     "; fan adhesion postprocess",
     "; fan restore postprocess",
 )
+
+# Hardcoded thresholds, limits and scan windows
+BED_X_MIN = 2.0
+BED_X_MAX = 218.0
+BED_Y_MIN = 2.0
+BED_Y_MAX = 218.0
+SKIRT_OFFSET_MM = 5.0
+TPU_MAX_SPEED_MM_S = 30.0
+TPU_SPEED_MULTIPLIER = 0.5
+TPU_PA_MULTIPLIER = 2.5
+PETG_PA_MULTIPLIER = 1.3
+Z_APPROACH_MIN = 0.5
+LOW_EST_TIME_SCAN_LIMIT = 100_000
+BBOX_SCAN_LIMIT = 100_000
+PEEK_SLICER_FAN_WINDOW = 24
+PEEK_RETRACT_WINDOW = 8
+KLIPPER_MESH_ENABLE = "BED_MESH_PROFILE LOAD=default ; postprocess mesh"
+

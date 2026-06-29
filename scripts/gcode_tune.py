@@ -1,18 +1,17 @@
 """Fan, seam, speed and retraction tuning for transform."""
 from __future__ import annotations
 
-from config import INVALID_MACRO_SNIPPET
+from config import INVALID_MACRO_SNIPPET, PEEK_SLICER_FAN_WINDOW, PEEK_RETRACT_WINDOW
 from gcode_emit import (
     FAN_BUILDERS,
     pp_cap_f_suffix,
     pp_fan_adhesion,
     pp_fan_seam,
-    pp_flow_seam,
     pp_layer_retract,
     pp_z_hop,
 )
 from gcode_features import preserves_geometry
-from gcode_patterns import FAN_ON_RE, F_RE, G29_RE, RETRACT_RE
+from gcode_patterns import FAN_ON_RE, F_RE, RETRACT_RE
 from profile import E5S1Profile
 
 
@@ -69,7 +68,7 @@ def layer_retract_lines(profile: E5S1Profile) -> list[str]:
     return lines
 
 
-def peek_slicer_fan(lines: list[str], idx: int, window: int = 24) -> tuple[int | None, int | None]:
+def peek_slicer_fan(lines: list[str], idx: int, window: int = PEEK_SLICER_FAN_WINDOW) -> tuple[int | None, int | None]:
     end = min(idx + 1 + window, len(lines))
     for j in range(idx + 1, end):
         stripped = lines[j].strip()
@@ -138,7 +137,7 @@ def apply_feature_fan_tune(
     return None
 
 
-def recent_retract(out: list[str], window: int = 8, *, seam: bool = False) -> bool:
+def recent_retract(out: list[str], window: int = PEEK_RETRACT_WINDOW, *, seam: bool = False) -> bool:
     for line in out[-window:]:
         stripped = line.strip()
         if not RETRACT_RE.match(stripped):

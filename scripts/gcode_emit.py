@@ -1,7 +1,7 @@
 """Post-process G-code line emitters (M/G codes and PP comment suffixes)."""
 from __future__ import annotations
 
-from config import ENABLE_MESH_ON_START, STARTUP_PURGE
+from config import ENABLE_MESH_ON_START, STARTUP_PURGE, KLIPPER_MESH_ENABLE
 
 PP_SKIRT = "postprocess skirt"
 
@@ -22,27 +22,12 @@ def pp_flow_bridge(pct: int) -> str:
     return f"M221 S{pct} ; postprocess flow bridge"
 
 
-def pp_flow_seam(pct: int) -> str:
-    return f"M221 S{pct} ; postprocess flow seam"
-
-
 def pp_z_hop(mm: float) -> str:
     return f"G1 Z{mm} F600 ; postprocess z hop"
 
 
 def pp_layer_retract(mm: float, retract_f: int) -> str:
     return f"G1 E-{mm} F{retract_f} ; postprocess layer retract"
-
-
-def pp_seam_retract(mm: float, retract_f: int) -> str:
-    return f"G1 E-{mm} F{retract_f} ; postprocess seam retract"
-
-
-def pp_seam_end(mm: float, retract_f: int) -> str:
-    return f"G1 E-{mm} F{retract_f} ; postprocess seam end"
-
-def pp_seam_deretract(mm: float, retract_f: int) -> str:
-    return f"G1 E{mm} F{retract_f} ; postprocess seam deretract"
 
 
 def pp_homing() -> str:
@@ -53,12 +38,21 @@ def pp_wait_hotend(temp: str | int) -> str:
     return f"M109 S{temp} ; postprocess wait hotend"
 
 
-def pp_mesh_enable() -> str:
+def pp_mesh_enable(pa_fw: str = "marlin") -> str:
+    if pa_fw == "klipper":
+        return KLIPPER_MESH_ENABLE
     return ENABLE_MESH_ON_START
 
 
-def pp_purge() -> str:
-    return STARTUP_PURGE
+def pp_purge(nozzle_diameter: float = 0.8, first_layer_height: float = 0.24) -> str:
+    e_first = 125.0 * first_layer_height * (nozzle_diameter * 1.25) / 2.405
+    e_second = e_first * 2.0
+    return f"""G1 X2.0 Y20 F5000.0 ; postprocess purge
+G1 Z{first_layer_height:.3f} F1500.0 ; postprocess purge
+G1 X2.0 Y145.0 Z{first_layer_height:.3f} F1500.0 E{e_first:.2f} ; postprocess purge
+G1 X2.3 Y145.0 Z{first_layer_height:.3f} F5000.0 ; postprocess purge
+G1 X2.3 Y20 Z{first_layer_height:.3f} F1500.0 E{e_second:.2f} ; postprocess purge
+G92 E0 ; postprocess purge"""
 
 
 def pp_z_fix_suffix() -> str:

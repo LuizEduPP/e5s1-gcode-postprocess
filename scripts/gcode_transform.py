@@ -307,7 +307,7 @@ def transform_gcode(
 
         out.append(stripped)
 
-    out, repair_actions = repair_gcode(out, profile)
+    out, repair_actions = repair_gcode(out, profile, pa_fw)
     actions.extend(repair_actions)
     out = strip_pp_lines(out)
     out, pa_action = inject_pa(out, pa_fw, profile["pa_k"])
