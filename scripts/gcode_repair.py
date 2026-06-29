@@ -19,18 +19,7 @@ from config import (
 )
 from gcode_emit import (
     PP_SKIRT,
-    pa_command,
-    pp_homing,
-    pp_layer_sync,
-    pp_mesh_enable,
-    pp_purge,
-    pp_skirt_comment,
-    pp_skirt_extrude,
-    pp_skirt_reset_e,
-    pp_skirt_travel,
-    pp_skirt_z,
-    pp_wait_hotend,
-    pp_z_fix_suffix,
+    GCodeBuilder,
 )
 from gcode_patterns import (
     G1_EXTRUDE_RE,
@@ -131,9 +120,9 @@ class PrintBoundingBoxScanner:
 
 class ContourSkirtGenerator:
     """Generates contour skirt loops dynamically around the print bounding box."""
-    def generate(self, profile: E5S1Profile, bbox: tuple[float, float, float, float] | None) -> list[str]:
+    def generate(self, profile: E5S1Profile, bbox: tuple[float, float, float, float] | None, builder: GCodeBuilder) -> list[str]:
         z_val = profile["first_layer_height_mm"]
-        lines = [pp_skirt_comment(), pp_skirt_z(z_val)]
+        lines = [builder.skirt_comment(), builder.skirt_z(z_val)]
 
         if bbox is not None:
             min_x, min_y, max_x, max_y = bbox
@@ -164,31 +153,31 @@ class ContourSkirtGenerator:
             segment_e_y = len_y * profile["skirt_extrusion_mm_per_mm"]
             lines.extend(
                 [
-                    pp_skirt_travel(x0, y0),
-                    pp_skirt_extrude(x1, y0, segment_e_x),
-                    pp_skirt_extrude(x1, y1, segment_e_y),
-                    pp_skirt_extrude(x0, y1, segment_e_x),
-                    pp_skirt_extrude(x0, y0, segment_e_y),
+                    builder.skirt_travel(x0, y0),
+                    builder.skirt_extrude(x1, y0, segment_e_x),
+                    builder.skirt_extrude(x1, y1, segment_e_y),
+                    builder.skirt_extrude(x0, y1, segment_e_x),
+                    builder.skirt_extrude(x0, y0, segment_e_y),
                 ]
             )
-        lines.append(pp_skirt_reset_e())
+        lines.append(builder.skirt_reset_e())
         return lines
 
 
 class IRepairStep:
     """Interface for G-code repair steps."""
-    def repair(self, lines: list[str], profile: E5S1Profile, pa_fw: str, actions: list[str]) -> list[str]:
+    def repair(self, lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
         raise NotImplementedError
 
 
 class HomingRepairStep(IRepairStep):
     """Ensures homing G28 is present in startup."""
-    def repair(self, lines: list[str], profile: E5S1Profile, pa_fw: str, actions: list[str]) -> list[str]:
+    def repair(self, lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
         h_idx = head_index(lines)
         head = list(lines[:h_idx])
         head_text = "\n".join(head)
         if not G28_RE.search(head_text):
-            head.insert(_comment_prefix_len(head), pp_homing())
+            head.insert(_comment_prefix_len(head), builder.homing())
             actions.append("g28_added")
             return head + lines[h_idx:]
         return lines
@@ -196,14 +185,14 @@ class HomingRepairStep(IRepairStep):
 
 class MeshLevelingRepairStep(IRepairStep):
     """Injects bed leveling mesh load if missing after G28."""
-    def repair(self, lines: list[str], profile: E5S1Profile, pa_fw: str, actions: list[str]) -> list[str]:
+    def repair(self, lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
         h_idx = head_index(lines)
         head = list(lines[:h_idx])
         head_text = "\n".join(head)
         g28_idx = _line_index(head, G28_RE)
         head_join = head_text.upper()
         if g28_idx is not None and "M420" not in head_join and "G29" not in head_join and "BED_MESH" not in head_join:
-            _insert_after(head, g28_idx, pp_mesh_enable(pa_fw))
+            _insert_after(head, g28_idx, builder.mesh_enable())
             actions.append("mesh_enabled")
             return head + lines[h_idx:]
         return lines
@@ -211,7 +200,7 @@ class MeshLevelingRepairStep(IRepairStep):
 
 class WaitHotendRepairStep(IRepairStep):
     """Ensures hotend temperature is reached before extrusion."""
-    def repair(self, lines: list[str], profile: E5S1Profile, pa_fw: str, actions: list[str]) -> list[str]:
+    def repair(self, lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
         h_idx = head_index(lines)
         head = list(lines[:h_idx])
         head_text = "\n".join(head)
@@ -222,7 +211,7 @@ class WaitHotendRepairStep(IRepairStep):
                     hotend_c = m.group(1)
             g28_idx = _line_index(head, G28_RE)
             mesh_idx = _line_index(head, M420_RE) or _line_index(head, re.compile(r"BED_MESH", re.I))
-            _insert_after(head, mesh_idx if mesh_idx is not None else g28_idx, pp_wait_hotend(hotend_c))
+            _insert_after(head, mesh_idx if mesh_idx is not None else g28_idx, builder.wait_hotend(hotend_c))
             actions.append("m109_added")
             return head + lines[h_idx:]
         return lines
@@ -230,14 +219,14 @@ class WaitHotendRepairStep(IRepairStep):
 
 class PurgeLineRepairStep(IRepairStep):
     """Injects dynamic purge line sequence to prime nozzle."""
-    def repair(self, lines: list[str], profile: E5S1Profile, pa_fw: str, actions: list[str]) -> list[str]:
+    def repair(self, lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
         h_idx = head_index(lines)
         head = list(lines[:h_idx])
         if not any(G1_EXTRUDE_RE.match(line.strip()) for line in head):
             m109_idx = _line_index(head, M109_RE)
             nozzle_dia = profile.get("nozzle_diameter_mm", 0.8)
             first_lh = profile["first_layer_height_mm"]
-            _insert_after(head, m109_idx, pp_purge(nozzle_dia, first_lh))
+            _insert_after(head, m109_idx, builder.purge(nozzle_dia, first_lh))
             actions.append("purge_added")
             return head + lines[h_idx:]
         return lines
@@ -245,13 +234,13 @@ class PurgeLineRepairStep(IRepairStep):
 
 class ZFixRepairStep(IRepairStep):
     """Adjusts Z height movements in first layer for offset corrections."""
-    def repair(self, lines: list[str], profile: E5S1Profile, pa_fw: str, actions: list[str]) -> list[str]:
+    def repair(self, lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
         h_idx = head_index(lines)
         head = list(lines[:h_idx])
         fixed_head: list[str] = []
         changed_any = False
         for line in head:
-            new_line, changed = _fix_z_line(line, profile["first_layer_height_mm"])
+            new_line, changed = _fix_z_line(line, profile["first_layer_height_mm"], builder)
             fixed_head.append(new_line)
             if changed:
                 actions.append("z_fix")
@@ -267,7 +256,7 @@ class SkirtInjectionRepairStep(IRepairStep):
         self.scanner = scanner
         self.generator = generator
 
-    def repair(self, lines: list[str], profile: E5S1Profile, pa_fw: str, actions: list[str]) -> list[str]:
+    def repair(self, lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
         h_idx = head_index(lines)
         head = list(lines[:h_idx])
         tail = lines[h_idx:]
@@ -275,7 +264,7 @@ class SkirtInjectionRepairStep(IRepairStep):
         has_skirt, has_brim = has_skirt_or_brim(body_preview)
         if not has_skirt and not has_brim and PP_SKIRT not in body_preview:
             bbox = self.scanner.scan(tail)
-            skirt_code = self.generator.generate(profile, bbox)
+            skirt_code = self.generator.generate(profile, bbox, builder)
             head = _insert_skirt_block(head, skirt_code)
             actions.append(f"skirt_added×{profile['skirt_loops']}")
             return head + tail
@@ -284,7 +273,7 @@ class SkirtInjectionRepairStep(IRepairStep):
 
 class StartupOrderNormalizationRepairStep(IRepairStep):
     """Normalizes the order of commands in start G-code."""
-    def repair(self, lines: list[str], profile: E5S1Profile, pa_fw: str, actions: list[str]) -> list[str]:
+    def repair(self, lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
         h_idx = head_index(lines)
         head = list(lines[:h_idx])
         normalized_head = _normalize_startup_order(head)
@@ -293,7 +282,7 @@ class StartupOrderNormalizationRepairStep(IRepairStep):
 
 class LayerMarkerRepairStep(IRepairStep):
     """Ensures layer markers are present and synchronized."""
-    def repair(self, lines: list[str], profile: E5S1Profile, pa_fw: str, actions: list[str]) -> list[str]:
+    def repair(self, lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
         body = "\n".join(lines)
         if body.count(LAYER_BEFORE_MARKER) == 0 and body.count(AFTER_LAYER_MARKER) > 0:
             patched: list[str] = []
@@ -301,7 +290,7 @@ class LayerMarkerRepairStep(IRepairStep):
                 if AFTER_LAYER_MARKER in line:
                     if not patched or patched[-1].strip() != LAYER_BEFORE_MARKER:
                         patched.append(LAYER_BEFORE_MARKER)
-                        patched.append(pp_layer_sync())
+                        patched.append(builder.layer_sync())
                         actions.append("layer_marker")
                 patched.append(line)
             return patched
@@ -309,20 +298,20 @@ class LayerMarkerRepairStep(IRepairStep):
             patched = list(lines)
             for i, line in enumerate(patched):
                 if LAYER_N_MARKER in line:
-                    patched[i:i] = [LAYER_BEFORE_MARKER, pp_layer_sync()]
+                    patched[i:i] = [LAYER_BEFORE_MARKER, builder.layer_sync()]
                     actions.append("layer_marker")
                     break
             return patched
         return lines
 
 
-def _fix_z_line(line: str, target: float) -> tuple[str, bool]:
+def _fix_z_line(line: str, target: float, builder: GCodeBuilder) -> tuple[str, bool]:
     m = Z_MOVE_RE.match(line.strip())
     if not m:
         return line, False
     z = float(m.group(1))
     if Z_MIN_WARN < z < Z_APPROACH_MAX:
-        return re.sub(r"(\bZ)([\d.]+)", rf"\g<1>{target}", line, count=1, flags=re.I) + pp_z_fix_suffix(), True
+        return re.sub(r"(\bZ)([\d.]+)", rf"\g<1>{target}", line, count=1, flags=re.I) + builder.z_fix_suffix(), True
     return line, False
 
 
@@ -401,6 +390,7 @@ def repair_gcode(lines: list[str], profile: E5S1Profile, pa_fw: str = "marlin") 
     
     scanner = PrintBoundingBoxScanner()
     generator = ContourSkirtGenerator()
+    builder = GCodeBuilder(pa_fw)
     
     steps: list[IRepairStep] = [
         HomingRepairStep(),
@@ -415,14 +405,15 @@ def repair_gcode(lines: list[str], profile: E5S1Profile, pa_fw: str = "marlin") 
     
     out = list(lines)
     for step in steps:
-        out = step.repair(out, profile, pa_fw, actions)
+        out = step.repair(out, profile, builder, actions)
         
     return out, actions
 
 
-def inject_pa(lines: list[str], pa_fw: str, pa_k: float) -> tuple[list[str], str | None]:
+def inject_pa(lines: list[str], pa_fw: str, pa_k: float, builder: GCodeBuilder | None = None) -> tuple[list[str], str | None]:
     if not pa_k or pa_fw == "none":
         return lines, None
+    builder = builder or GCodeBuilder(pa_fw)
     head = lines[:head_index(lines)]
     has_pa = any(PA_KLIPPER_RE.search(line) for line in head) if pa_fw == "klipper" else any(
         M900_RE.match(line.strip()) for line in head
@@ -438,5 +429,5 @@ def inject_pa(lines: list[str], pa_fw: str, pa_k: float) -> tuple[list[str], str
         if not m109:
             return lines, None
         extrusion_idx = m109[-1]
-    cmd = pa_command(pa_fw, pa_k)
+    cmd = builder.pressure_advance(pa_k)
     return lines[:extrusion_idx + 1] + [cmd] + lines[extrusion_idx + 1:], f"pa_{pa_fw}_{pa_k}"
