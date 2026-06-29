@@ -90,6 +90,18 @@ class IGCodeAnalyzer(abc.ABC):
     def get_stats(self, text: str, analysis: GcodeAnalysis | None = None, fan_pp: int | None = None) -> dict:
         pass
 
+    @abc.abstractmethod
+    def is_postprocessed(self, text: str) -> bool:
+        pass
+
+    @abc.abstractmethod
+    def count_pp_fan_lines(self, text: str, large: bool) -> int:
+        pass
+
+    @abc.abstractmethod
+    def has_pressure_advance(self, text: str) -> bool:
+        pass
+
 
 class IGCodeValidator(abc.ABC):
     @abc.abstractmethod
@@ -171,6 +183,20 @@ class GCodeAnalyzer(IGCodeAnalyzer):
     def needs_support(self, overhang_markers: int, has_support: bool) -> bool:
         return overhang_markers >= SUPPORT_OVERHANG_MIN and not has_support
 
+    def is_postprocessed(self, text: str) -> bool:
+        return MARKER in text
+
+    def count_pp_fan_lines(self, text: str, large: bool) -> int:
+        if large:
+            return sum(text.count(tag) for tag in PP_FAN_TAGS)
+        return len(PP_FAN_RE.findall(text))
+
+    def has_pressure_advance(self, text: str) -> bool:
+        pa_fw = resolve_pa_firmware(text[:HEAD_SCAN_BYTES])
+        if pa_fw == "none":
+            return True
+        return bool(PA_KLIPPER_RE.search(text)) if pa_fw == "klipper" else bool(M900_RE.search(text))
+
     def analyze(self, text: str, hint: str = "") -> GcodeAnalysis:
         large = self.is_large_gcode(text)
         prusa_cfg = parse_prusa_config(text)
@@ -223,9 +249,9 @@ class GCodeAnalyzer(IGCodeAnalyzer):
         return {
             "layers": a["layers"],
             "lines": a["lines"],
-            "fan_pp": fan_pp if fan_pp is not None else count_pp_fan_lines(text, a["large"]),
-            "postprocessed": is_postprocessed(text),
-            "pressure_advance": _has_pressure_advance(text[:HEAD_SCAN_BYTES]),
+            "fan_pp": fan_pp if fan_pp is not None else self.count_pp_fan_lines(text, a["large"]),
+            "postprocessed": self.is_postprocessed(text),
+            "pressure_advance": self.has_pressure_advance(text[:HEAD_SCAN_BYTES]),
             **{k: a[k] for k in _STAT_FIELDS},
         }
 
@@ -234,24 +260,30 @@ class GCodeValidator(IGCodeValidator):
     def __init__(self, analyzer: IGCodeAnalyzer | None = None):
         self.analyzer = analyzer or GCodeAnalyzer()
 
+    def _startup_text(self, text: str) -> str:
+        for marker in (LAYER_CHANGE_MARKER, LAYER_BEFORE_MARKER, AFTER_LAYER_MARKER):
+            if marker in text:
+                return text.split(marker, 1)[0]
+        return text
+
     def validate(self, text: str, expect_postprocess: bool = False, analysis: GcodeAnalysis | None = None) -> tuple[list[str], list[str]]:
         errors: list[str] = []
         warnings: list[str] = []
         analysis = analysis or self.analyzer.analyze(text)
-        startup = _startup_text(text)
+        startup = self._startup_text(text)
         large = analysis["large"]
-        pp = is_postprocessed(text)
+        pp = self.analyzer.is_postprocessed(text)
 
         if INVALID_MACRO_SNIPPET in text[:HEAD_SCAN_BYTES] and not pp:
             errors.append("Invalid macro first_layer_height[0] in gcode")
 
         if expect_postprocess and not pp:
             warnings.append("Missing E5S1 marker — post-process not applied")
-        elif expect_postprocess and count_pp_fan_lines(text, large) == 0:
+        elif expect_postprocess and self.analyzer.count_pp_fan_lines(text, large) == 0:
             warnings.append("Marker present but no post-process M106 fan commands")
 
         if not pp:
-            if not _has_pressure_advance(text[:HEAD_SCAN_BYTES]):
+            if not self.analyzer.has_pressure_advance(text[:HEAD_SCAN_BYTES]):
                 warnings.append("No linear advance — corners may blob")
             if not M109_RE.search(startup):
                 warnings.append("Purge without M109 — filament may extrude cold")
@@ -290,5 +322,3 @@ class GCodeValidator(IGCodeValidator):
 
         return errors, warnings
 
-
-    return text

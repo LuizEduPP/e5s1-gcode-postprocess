@@ -17,6 +17,11 @@ class IExportFinder(abc.ABC):
         pass
 
 
+    @abc.abstractmethod
+    def path_note(self, path: Path, argv: list[str] | None = None, export: Path | None = None) -> str:
+        pass
+
+
 class RecentExportFinder(IExportFinder):
     def _recent_gcode_candidates(self, folder: Path, now: float, max_age_s: int, max_files: int) -> list[Path]:
         heap: list[tuple[float, int, Path]] = []
@@ -56,20 +61,15 @@ class RecentExportFinder(IExportFinder):
                     continue
         return None
 
-
-def find_recent_export(max_age_s: int = 300, max_files: int = 5) -> Path | None:
-    return RecentExportFinder().find_recent_export(max_age_s, max_files)
-
-
-def path_note(path: Path, argv: list[str] | None = None, export: Path | None = None) -> str:
-    note = str(path)
-    if path.suffix == ".pp" or str(path).endswith(".gcode.pp"):
-        note += " (temp PrusaSlicer)"
-        final = Path(str(path).removesuffix(".pp"))
-        if final.is_file():
-            note += f" | final={final}"
-        if export:
-            note += f" | export={export}"
-    if argv and len(argv) > 1:
-        note += f" | argv_extra={argv[1:]}"
-    return note
+    def path_note(self, path: Path, argv: list[str] | None = None, export: Path | None = None) -> str:
+        note = str(path)
+        if path.suffix == ".pp" or str(path).endswith(".gcode.pp"):
+            note += " (temp PrusaSlicer)"
+            final = Path(str(path).removesuffix(".pp"))
+            if final.is_file():
+                note += f" | final={final}"
+            if export:
+                note += f" | export={export}"
+        if argv and len(argv) > 1:
+            note += f" | argv_extra={argv[1:]}"
+        return note

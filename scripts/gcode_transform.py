@@ -14,7 +14,7 @@ from config import (
     PA_PROBE_LINES,
     AFTER_LAYER_MARKER,
 )
-from gcode_patterns import F_RE, FAN_ON_RE, G1_EXTRUDE_RE, M204_S_RE, strip_pp_lines
+from gcode_patterns import F_RE, FAN_ON_RE, G1_EXTRUDE_RE, M204_S_RE, GCodePatternMatcher
 from gcode_emit import GCodeBuilder
 from gcode_features import GCodeFeatureScanner
 from gcode_repair import inject_pa, repair_gcode
@@ -326,7 +326,8 @@ def transform_gcode(
 
     out, repair_actions = repair_gcode(ctx.out, profile, pa_fw)
     ctx.actions.extend(repair_actions)
-    out = strip_pp_lines(out)
+    pattern_matcher = GCodePatternMatcher()
+    out = pattern_matcher.strip_pp_lines(out)
     out, pa_action = inject_pa(out, pa_fw, profile["pa_k"], builder)
     if pa_action:
         ctx.actions.append(pa_action)
