@@ -43,6 +43,7 @@ from gcode_tune import (
     speed_cap_for,
 )
 from profile import E5S1Profile, build_e5s1_profile, resolve_pa_firmware
+from bundle_config import get_bundle_config
 
 
 def _apply_layer_start(
@@ -158,7 +159,8 @@ def transform_gcode(
     prusa_cfg: dict[str, str] | None = None,
 ) -> tuple[list[str], list[str]]:
     actions: list[str] = []
-    profile = build_e5s1_profile(prusa_cfg)
+    bundle = get_bundle_config()
+    profile = build_e5s1_profile(prusa_cfg, bundle)
     pa_fw = resolve_pa_firmware("\n".join(lines[:PA_PROBE_LINES]))
     out: list[str] = []
     layer_count = 0
