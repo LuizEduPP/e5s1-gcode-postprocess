@@ -24,6 +24,19 @@ LAYER_BEFORE_MARKER = ";BEFORE_LAYER_CHANGE"
 LAYER_CHANGE_MARKER = ";LAYER_CHANGE"
 AFTER_LAYER_MARKER = ";AFTER_LAYER_CHANGE"
 LAYER_N_MARKER = ";LAYER:"
+LAYER_MARKERS = (LAYER_BEFORE_MARKER, LAYER_CHANGE_MARKER, AFTER_LAYER_MARKER)
+LAYER_START_MARKERS = (LAYER_BEFORE_MARKER, AFTER_LAYER_MARKER)
+
+FEAT_SEAM = frozenset({"external", "perimeter"})
+FEAT_FAN_TUNE = frozenset({"external", "perimeter", "top", "ironing", "interface", "support", "bottom", "brim"})
+FEAT_FAN_BOOST = frozenset({"top", "ironing", "interface", "support", "bottom", "external", "perimeter", "brim", "bridge", "overhang"})
+FEAT_COOL = frozenset({"bridge", "overhang"})
+FEAT_WALL = frozenset({"external", "perimeter", "gap_fill", "brim"})
+FEAT_WALL_CAP = frozenset({"external", "perimeter", "gap_fill"})
+FEAT_INFILL = frozenset({"internal", "solid", "support"})
+FEAT_PERIMETER = frozenset({"external", "perimeter"})
+
+AXIS_NUM = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
 
 HEAD_SCAN_BYTES = 8000
 SLICER_META_SCAN_BYTES = 32000
@@ -108,7 +121,6 @@ FLOW_NORMAL_PCT = 100
 MM_S_TO_F = 60
 
 NOZZLE_DIAMETER_MM = 0.8
-FILAMENT_TYPE = "PLA"
 LAYER_HEIGHT_FIRST_MM = 0.24
 TEMP_FIRST_LAYER_C = "215"
 MAX_VOLUMETRIC_FLOW_MM3_S = 15.0
@@ -180,7 +192,7 @@ EXPORT_MAX_FILES = 5
 F_RE = re.compile(r"F(\d+)", re.IGNORECASE)
 FAN_ON_RE = re.compile(r"^M106\s+S(\d+)", re.IGNORECASE)
 PP_FAN_RE = re.compile(r"^M106\s+S\d+\s*;.*postprocess", re.IGNORECASE | re.MULTILINE)
-G1_EXTRUDE_RE = re.compile(r"^G1\b.*\bE[-+]?\d", re.IGNORECASE | re.MULTILINE)
+G1_EXTRUDE_RE = re.compile(r"^G[0-3]\b.*\bE[-+]?\d", re.IGNORECASE | re.MULTILINE)
 RETRACT_RE = re.compile(r"^G1\b.*\bE-", re.IGNORECASE)
 MOTION_RE = re.compile(r"^[GM]\d", re.IGNORECASE)
 M104_RE = re.compile(r"^M104\s+S(\d+)", re.IGNORECASE)
@@ -193,13 +205,16 @@ M900_RE = re.compile(r"^M900\b", re.IGNORECASE | re.MULTILINE)
 G28_RE = re.compile(r"^G28\b", re.MULTILINE)
 G29_RE = re.compile(r"^G29\b", re.IGNORECASE)
 G01_LINE_RE = re.compile(r"^G0?1\b", re.I)
+G91_RE = re.compile(r"^G91\b", re.I)
+G90_RE = re.compile(r"^G90\b", re.I)
+Z_VAL_RE = re.compile(rf"\bZ({AXIS_NUM})", re.I)
 LAYER_H_RE = re.compile(r";\s*layer_height\s*[=:]\s*([\d.,]+)", re.IGNORECASE)
 LAYER_H_PATH_RE = re.compile(r"_(\d+[,.]\d+)mm_", re.IGNORECASE)
 SLICER_TIME_RE = re.compile(r"; estimated printing time[^=\n]*=\s*(.+)", re.IGNORECASE)
 BED_MESH_RE = re.compile(r"BED_MESH", re.I)
-X_VAL_RE = re.compile(r"\b[Xx]([\d.-]+)")
-Y_VAL_RE = re.compile(r"\b[Yy]([\d.-]+)")
-E_VAL_RE = re.compile(r"\b[Ee]([\d.-]+)")
+X_VAL_RE = re.compile(rf"\b[Xx]({AXIS_NUM})")
+Y_VAL_RE = re.compile(rf"\b[Yy]({AXIS_NUM})")
+E_VAL_RE = re.compile(rf"\b[Ee]({AXIS_NUM})")
 
 class E5S1Profile(TypedDict):
     retract_mm: float
@@ -241,7 +256,6 @@ class E5S1Profile(TypedDict):
     first_layer_height_mm: float
     first_layer_temperature_c: str
     nozzle_diameter_mm: float
-    filament_type: str
     max_volumetric_flow: float
 
 class GcodeAnalysis(TypedDict):
@@ -262,6 +276,24 @@ class GcodeAnalysis(TypedDict):
     slicer_time: str | None
     lines: int
     large: bool
+
+_ANALYSIS_STAT_KEYS = (
+    "layers",
+    "lines",
+    "overhang_markers",
+    "has_support",
+    "has_skirt",
+    "has_brim",
+    "needs_support",
+    "top_lines",
+    "ironing_lines",
+    "interface_lines",
+    "has_ironing",
+    "top_pattern",
+    "extrude_lines",
+    "layer_h",
+    "est_seconds",
+)
 
 class GcodeStats(TypedDict):
     layers: int
@@ -298,11 +330,12 @@ def _parse_custom_parameters(raw: str) -> dict[str, str]:
     out: dict[str, str] = {}
     if not raw or raw.strip() in ("", '""', "''"):
         return out
-    for part in raw.replace("\n", ";").split(";"):
-        part = part.strip().strip('"')
-        if " = " in part:
-            key, val = part.split(" = ", 1)
-            out[key.strip()] = val.strip()
+    for line in raw.splitlines():
+        for part in line.split(";"):
+            part = part.strip().strip('"')
+            if " = " in part:
+                key, val = part.split(" = ", 1)
+                out[key.strip()] = val.strip()
     return out
 
 def _merge_custom_parameters(cfg: dict[str, str]) -> dict[str, str]:
@@ -374,11 +407,15 @@ def build_e5s1_profile() -> E5S1Profile:
         "first_layer_height_mm": LAYER_HEIGHT_FIRST_MM,
         "first_layer_temperature_c": TEMP_FIRST_LAYER_C,
         "nozzle_diameter_mm": NOZZLE_DIAMETER_MM,
-        "filament_type": FILAMENT_TYPE,
         "max_volumetric_flow": MAX_VOLUMETRIC_FLOW_MM3_S,
     }
 
-def count_layers(text: str, prusa_cfg: dict[str, str] | None = None) -> int:
+def _axis_float(match: re.Match[str] | None) -> float | None:
+    if not match:
+        return None
+    return float(match.group(1))
+
+def count_layers(text: str, prusa_cfg: dict[str, str]) -> int:
     before = text.count(LAYER_BEFORE_MARKER)
     if before:
         lc, bf = text.find(LAYER_CHANGE_MARKER), text.find(LAYER_BEFORE_MARKER)
@@ -392,8 +429,6 @@ def count_layers(text: str, prusa_cfg: dict[str, str] | None = None) -> int:
     lc = text.count(LAYER_CHANGE_MARKER)
     if lc:
         return lc
-    if prusa_cfg is None:
-        prusa_cfg = parse_prusa_config(text)
     for key in PRUSA_LAYER_COUNT_KEYS:
         if key in prusa_cfg and prusa_cfg[key].isdigit():
             return int(prusa_cfg[key])
@@ -427,6 +462,7 @@ def is_pp_line(line: str, *, pa_only: bool = False) -> bool:
     return bool(";" in stripped and "postprocess" in stripped.split(";", 1)[1].lower())
 
 def strip_pp_lines(lines: list[str], full: bool = False) -> list[str]:
+    """Remove postprocess lines. Default (full=False) strips only duplicate M900 PA."""
     return [ln for ln in lines if not is_pp_line(ln, pa_only=not full)]
 
 _TYPE_KIND_ORDER: tuple[tuple[str, str], ...] = (
@@ -493,6 +529,9 @@ class GCodeBuilder:
 
     def homing(self) -> str:
         return "G28 ; postprocess homing"
+
+    def absolute_mode(self) -> str:
+        return "G90 ; postprocess absolute"
 
     def wait_hotend(self, temp: str | int) -> str:
         return f"M109 S{temp} ; postprocess wait hotend"
@@ -641,25 +680,25 @@ class GCodeAnalyzer:
     def has_pressure_advance(self, text: str) -> bool:
         return bool(M900_RE.search(text))
 
-    def analyze(self, text: str, hint: str = "") -> GcodeAnalysis:
+    def analyze(self, text: str, hint: str = "", *, prusa_cfg: dict[str, str] | None = None) -> GcodeAnalysis:
         large = self.is_large_gcode(text)
-        prusa_cfg = parse_prusa_config(text)
+        cfg = prusa_cfg if prusa_cfg is not None else parse_prusa_config(text)
         has_sup = TYPE_SUPPORT in text or TYPE_SUPPORT_MAT in text or TYPE_INTERFACE in text
         has_skirt, has_brim = has_skirt_or_brim(text)
         overhang = self.count_type_markers(text, TYPE_OVERHANG)
         top_lines = self.count_type_markers(text, TYPE_TOP_SOLID)
         ironing_lines = self.count_type_markers(text, TYPE_IRONING)
         interface_lines = self.count_type_markers(text, TYPE_INTERFACE)
-        cfg_ironing = prusa_cfg.get(PRUSA_KEY_IRONING, "0") not in ("0", "false", "")
+        cfg_ironing = cfg.get(PRUSA_KEY_IRONING, "0") not in ("0", "false", "")
         has_ironing = ironing_lines > 0 or cfg_ironing
-        top_pattern = prusa_cfg.get(PRUSA_KEY_TOP_SOLID_INFILL_PATTERN) or None
+        top_pattern = cfg.get(PRUSA_KEY_TOP_SOLID_INFILL_PATTERN) or None
         if large:
             extrude_lines = max(text.count("\nG1"), top_lines * LARGE_EXTRUDE_LINE_ESTIMATE_MULT, 1)
         else:
             extrude_lines = sum(1 for ln in text.splitlines() if G1_EXTRUDE_RE.match(ln.strip()))
         est_raw, layer_h = self._slicer_metadata(text)
         if layer_h is None:
-            lh = prusa_cfg.get(PRUSA_KEY_LAYER_HEIGHT) or prusa_cfg.get(PRUSA_KEY_FIRST_LAYER_HEIGHT)
+            lh = cfg.get(PRUSA_KEY_LAYER_HEIGHT) or cfg.get(PRUSA_KEY_FIRST_LAYER_HEIGHT)
             if lh:
                 try:
                     layer_h = float(lh.replace(",", "."))
@@ -674,7 +713,7 @@ class GCodeAnalyzer:
             "has_skirt": has_skirt,
             "has_brim": has_brim,
             "needs_support": self.needs_support(overhang, has_sup),
-            "layers": count_layers(text, prusa_cfg),
+            "layers": count_layers(text, cfg),
             "top_lines": top_lines,
             "ironing_lines": ironing_lines,
             "interface_lines": interface_lines,
@@ -691,24 +730,10 @@ class GCodeAnalyzer:
     def get_stats(self, text: str, analysis: GcodeAnalysis | None = None, fan_pp: int | None = None) -> GcodeStats:
         a = analysis or self.analyze(text)
         return {
-            "layers": a["layers"],
-            "lines": a["lines"],
+            **{k: a[k] for k in _ANALYSIS_STAT_KEYS},
             "fan_pp": fan_pp if fan_pp is not None else self.count_pp_fan_lines(text, a["large"]),
             "postprocessed": self.is_postprocessed(text),
             "pressure_advance": self.has_pressure_advance(text[:HEAD_SCAN_BYTES]),
-            "overhang_markers": a["overhang_markers"],
-            "has_support": a["has_support"],
-            "has_skirt": a["has_skirt"],
-            "has_brim": a["has_brim"],
-            "needs_support": a["needs_support"],
-            "top_lines": a["top_lines"],
-            "ironing_lines": a["ironing_lines"],
-            "interface_lines": a["interface_lines"],
-            "has_ironing": a["has_ironing"],
-            "top_pattern": a["top_pattern"],
-            "extrude_lines": a["extrude_lines"],
-            "layer_h": a["layer_h"],
-            "est_seconds": a["est_seconds"],
         }
 
 class GCodeValidator:
@@ -716,7 +741,7 @@ class GCodeValidator:
         self.analyzer = analyzer or GCodeAnalyzer()
 
     def _startup_text(self, text: str) -> str:
-        for marker in (LAYER_CHANGE_MARKER, LAYER_BEFORE_MARKER, AFTER_LAYER_MARKER):
+        for marker in LAYER_MARKERS:
             if marker in text:
                 return text.split(marker, 1)[0]
         return text
@@ -761,7 +786,15 @@ class GCodeValidator:
             warnings.append("No G28 (homing) in file")
 
         if not large:
-            z_low = [z for z in (_z_from_motion_line(line) for line in startup.splitlines()) if z is not None and z < Z_VALIDATION_LOW_MM]
+            relative = False
+            z_low: list[float] = []
+            for line in startup.splitlines():
+                relative = _coord_relative(line, relative)
+                if relative:
+                    continue
+                z = _z_from_motion_line(line)
+                if z is not None and z < Z_VALIDATION_LOW_MM:
+                    z_low.append(z)
             if z_low and min(z_low) < Z_MIN_WARN:
                 warnings.append(f"Minimum Z {min(z_low):.2f}mm — check Z-offset")
 
@@ -800,17 +833,17 @@ def speed_cap_for(
     if in_startup or layer_count <= 1:
         return min(profile["first_layer_f"], ceiling)
     if layer_count <= profile["cap_extrusion_layers"]:
-        if kind in ("external", "perimeter", "gap_fill", "brim"):
+        if kind in FEAT_WALL:
             cap = min(profile["wall_early_f"], ceiling)
         else:
             cap = min(profile["cap_extrusion_f"], ceiling)
-    elif kind in ("internal", "solid", "support"):
+    elif kind in FEAT_INFILL:
         cap = min(profile["max_infill_f"], ceiling)
     else:
         cap = None
-    if kind in ("external", "perimeter", "gap_fill") and cap is not None:
+    if kind in FEAT_WALL_CAP and cap is not None:
         cap = min(cap, profile["seam_join_f"])
-    elif kind in ("external", "perimeter", "gap_fill"):
+    elif kind in FEAT_WALL_CAP:
         cap = profile["seam_join_f"]
     return cap
 
@@ -823,17 +856,11 @@ def layer_retract_lines(profile: E5S1Profile, builder: GCodeBuilder, *, seam_ext
         lines.append(builder.seam_extra_retract(profile["seam_extra_retract"], profile["retract_f"]))
     return lines
 
-def recent_retract(out: list[str], window: int = PEEK_RETRACT_WINDOW, *, seam: bool = False) -> bool:
+def recent_retract(out: list[str], window: int = PEEK_RETRACT_WINDOW) -> bool:
     for line in out[-window:]:
-        stripped = line.strip()
-        if not RETRACT_RE.match(stripped):
+        if not RETRACT_RE.match(line.strip()):
             continue
-        low = line.lower()
-        if "postprocess" not in low:
-            continue
-        if seam:
-            return True
-        if "postprocess layer retract" not in low:
+        if "postprocess" in line.lower():
             return True
     return False
 
@@ -858,10 +885,10 @@ def peek_slicer_fan(lines: list[str], idx: int, window: int = PEEK_SLICER_FAN_WI
 def e5s1_fan_target_label(kind: str, layer_count: int, layer_fan_cap: int | None, profile: E5S1Profile) -> tuple[int, str] | None:
     if pwm_key := FAN_PROFILE_KEYS.get(kind):
         return profile[pwm_key], kind
-    if kind in ("external", "perimeter") and layer_count > profile["fan_off_layers"]:
+    if kind in FEAT_SEAM and layer_count > profile["fan_off_layers"]:
         pwm = min(profile["seam_fan_pwm"], profile["min_fan_pwm"]) if kind == "perimeter" else profile["seam_fan_pwm"]
         return pwm, "seam"
-    if kind in ("bottom", "external", "perimeter", "brim") and layer_count <= profile["fan_off_layers"]:
+    if kind in (FEAT_SEAM | {"bottom", "brim"}) and layer_count <= profile["fan_off_layers"]:
         return (layer_fan_cap if layer_fan_cap is not None else 0), "adhesion"
     return None
 
@@ -899,7 +926,7 @@ def sanitize_startup_line(line: str, first_layer_height_mm: float) -> tuple[str 
 
 def head_index(lines: list[str], fallback: int | None = None) -> int:
     for i, line in enumerate(lines):
-        if LAYER_BEFORE_MARKER in line or LAYER_CHANGE_MARKER in line or AFTER_LAYER_MARKER in line:
+        if any(marker in line for marker in LAYER_MARKERS):
             return i
     if fallback is not None:
         return fallback
@@ -929,12 +956,13 @@ def scan_bounding_box(lines: list[str]) -> tuple[float, float, float, float] | N
                     x_match = X_VAL_RE.search(stripped)
                     y_match = Y_VAL_RE.search(stripped)
                     if x_match:
-                        x = float(x_match.group(1))
+                        x = _axis_float(x_match)
+                    y = _axis_float(y_match)
+                    if x is not None:
                         min_x = min(min_x, x)
                         max_x = max(max_x, x)
                         has_moves = True
-                    if y_match:
-                        y = float(y_match.group(1))
+                    if y is not None:
                         min_y = min(min_y, y)
                         max_y = max(max_y, y)
                         has_moves = True
@@ -943,29 +971,54 @@ def scan_bounding_box(lines: list[str]) -> tuple[float, float, float, float] | N
         return min_x, min_y, max_x, max_y
     return None
 
-def _z_from_motion_line(line: str) -> float | None:
+def _coord_relative(line: str, relative: bool) -> bool:
+    stripped = line.strip()
+    if G91_RE.match(stripped):
+        return True
+    if G90_RE.match(stripped):
+        return False
+    return relative
+
+def _head_relative_mode(head: list[str]) -> bool:
+    relative = False
+    for line in head:
+        relative = _coord_relative(line, relative)
+    return relative
+
+def _z_from_motion_line(line: str, *, relative: bool = False) -> float | None:
+    if relative:
+        return None
     stripped = line.strip()
     if stripped.startswith(";"):
         return None
     head = stripped.split(";", 1)[0].strip()
     if not G01_LINE_RE.match(head):
         return None
-    m = re.search(r"\bZ([\d.+-]+)", head, re.I)
+    m = Z_VAL_RE.search(head)
     if not m:
         return None
-    try:
-        return float(m.group(1))
-    except ValueError:
-        return None
+    return float(m.group(1))
 
-def _fix_z_line(line: str, target: float, builder: GCodeBuilder) -> tuple[str, bool]:
-    z = _z_from_motion_line(line)
+def _fix_z_line(line: str, target: float, builder: GCodeBuilder, *, relative: bool = False) -> tuple[str, bool]:
+    z = _z_from_motion_line(line, relative=relative)
     if z is None or z >= Z_MIN_WARN:
         return line, False
     head, sep, tail = line.partition(";")
-    fixed_head = re.sub(r"(\bZ)([\d.+-]+)", rf"\g<1>{target}", head, count=1, flags=re.I)
+    fixed_head = Z_VAL_RE.sub(rf"Z{target}", head, count=1)
     suffix = f"{sep}{tail}" if sep else ""
     return fixed_head + suffix + builder.z_fix_suffix(), True
+
+def _fix_z_startup_head(head: list[str], target: float, builder: GCodeBuilder) -> tuple[list[str], bool, bool]:
+    fixed_head: list[str] = []
+    z_changed = False
+    relative = False
+    for line in head:
+        relative = _coord_relative(line, relative)
+        new_line, line_changed = _fix_z_line(line, target, builder, relative=relative)
+        fixed_head.append(new_line)
+        if line_changed:
+            z_changed = True
+    return fixed_head, z_changed, relative
 
 def generate_contour_skirt(profile: E5S1Profile, bbox: tuple[float, float, float, float] | None, builder: GCodeBuilder) -> list[str]:
     z_val = profile["first_layer_height_mm"]
@@ -1103,23 +1156,26 @@ def repair_startup(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder
         actions.append("m109_added")
         changed = True
     if not any(G1_EXTRUDE_RE.match(line.strip()) for line in head):
-        _insert_after(head, _line_index(head, M109_RE), builder.purge(profile.get("nozzle_diameter_mm", NOZZLE_DIAMETER_MM), profile["first_layer_height_mm"]))
+        purge_at = _line_index(head, M109_RE)
+        purge_block = builder.purge(profile["nozzle_diameter_mm"], profile["first_layer_height_mm"])
+        if _head_relative_mode(head):
+            purge_block = f"{builder.absolute_mode()}\n{purge_block}"
+            actions.append("g90_before_purge")
+        _insert_after(head, purge_at, purge_block)
         actions.append("purge_added")
         changed = True
-    fixed_head: list[str] = []
-    z_changed = False
-    for line in head:
-        new_line, line_changed = _fix_z_line(line, profile["first_layer_height_mm"], builder)
-        fixed_head.append(new_line)
-        if line_changed:
-            z_changed = True
+    fixed_head, z_changed, _ = _fix_z_startup_head(head, profile["first_layer_height_mm"], builder)
+    head = fixed_head
     if z_changed:
-        head = fixed_head
         actions.append("z_fix")
         changed = True
     has_skirt, has_brim = has_skirt_or_brim(lines)
     if not has_skirt and not has_brim and not any(PP_SKIRT in line for line in lines):
-        head = _insert_skirt_block(head, generate_contour_skirt(profile, scan_bounding_box(tail), builder))
+        skirt_block = generate_contour_skirt(profile, scan_bounding_box(tail), builder)
+        if _head_relative_mode(head):
+            skirt_block = [builder.absolute_mode(), *skirt_block]
+            actions.append("g90_before_skirt")
+        head = _insert_skirt_block(head, skirt_block)
         actions.append(f"skirt_added×{profile['skirt_loops']}")
         changed = True
     normalized_head = _normalize_startup_order(head)
@@ -1148,7 +1204,7 @@ def repair_small_perimeters(
 
     for i, line in enumerate(region):
         feat = type_feature(line)
-        if feat in ("external", "perimeter"):
+        if feat in FEAT_PERIMETER:
             if curr_seg:
                 segments.append((curr_seg, curr_dist))
             in_perimeter = True
@@ -1161,14 +1217,15 @@ def repair_small_perimeters(
                 curr_seg = []
 
         upper = line.upper()
-        if upper.startswith(("G0", "G1")):
+        if upper.startswith(("G0", "G1", "G2", "G3")):
             m_x = X_VAL_RE.search(upper)
             m_y = Y_VAL_RE.search(upper)
             m_e = E_VAL_RE.search(upper)
 
-            x = float(m_x.group(1)) if m_x else last_x
-            y = float(m_y.group(1)) if m_y else last_y
-            is_extrude = bool(m_e and not m_e.group(1).startswith("-") and m_e.group(1) != "0")
+            x = _axis_float(m_x) if m_x else last_x
+            y = _axis_float(m_y) if m_y else last_y
+            e_val = m_e.group(1) if m_e else None
+            is_extrude = bool(e_val is not None and not e_val.startswith("-") and e_val != "0")
 
             if in_perimeter and is_extrude:
                 if not curr_seg:
@@ -1202,7 +1259,12 @@ def repair_small_perimeters(
     actions.append(f"small_perimeters_fixed×{len(small_segments)}")
     return lines[:start] + out
 
-def repair_layer_marker(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
+def repair_layer_marker(
+    lines: list[str],
+    builder: GCodeBuilder,
+    actions: list[str],
+    prusa_cfg: dict[str, str],
+) -> list[str]:
     before_count = after_count = change_count = 0
     for line in lines:
         if LAYER_BEFORE_MARKER in line:
@@ -1231,7 +1293,7 @@ def repair_layer_marker(lines: list[str], profile: E5S1Profile, builder: GCodeBu
                 actions.append("layer_marker")
             patched.append(line)
         return patched
-    if count_layers("\n".join(lines)) == 0:
+    if count_layers(joined := "\n".join(lines), prusa_cfg) == 0:
         patched = list(lines)
         for i, line in enumerate(patched):
             if LAYER_N_MARKER in line:
@@ -1285,6 +1347,7 @@ class TransformContext:
         self.flow_bridge = False
         self.seam_flow = False
         self.surface_kind: str | None = None
+        self.pending_surface_clear = False
         self.last_f = profile["default_motion_f"]
         self.last_pa_k: float | None = None
         self.skip_fan_at: set[int] = set()
@@ -1306,11 +1369,11 @@ class TransformContext:
         if self.builder.pa_fw != PA_FIRMWARE or self.profile["pa_k"] <= 0:
             return
         scale = 1.0
-        if feat in ("external", "perimeter"):
+        if feat in FEAT_SEAM:
             scale = PA_PERIMETER_SCALE
         elif feat in ("internal", "solid"):
             scale = PA_INFILL_SCALE
-        elif feat in ("bridge", "overhang"):
+        elif feat in FEAT_COOL:
             scale = PA_BRIDGE_SCALE
         elif feat == "ironing":
             scale = PA_IRONING_SCALE
@@ -1350,7 +1413,7 @@ class TransformContext:
         self.layer_fan_cap = cap
 
 def transform_speed_tracking(ctx: TransformContext, lines: list[str], idx: int) -> bool:
-    if ctx.current_upper.startswith(("G0", "G1")) and (fm := F_RE.search(ctx.current_line)):
+    if ctx.current_upper.startswith(("G0", "G1", "G2", "G3")) and (fm := F_RE.search(ctx.current_line)):
         ctx.last_f = int(fm.group(1))
     return False
 
@@ -1374,7 +1437,9 @@ def transform_header(ctx: TransformContext, lines: list[str], idx: int) -> bool:
 
 def transform_feature_type(ctx: TransformContext, lines: list[str], idx: int) -> bool:
     feat = type_feature(ctx.current_line)
-    if feat in ("bridge", "overhang"):
+    if feat is not None:
+        ctx.pending_surface_clear = False
+    if feat in FEAT_COOL:
         if ctx.cool_boost:
             ctx.restore_layer_fan()
         ctx.reset_flow()
@@ -1400,13 +1465,13 @@ def transform_feature_type(ctx: TransformContext, lines: list[str], idx: int) ->
             ctx.restore_layer_fan()
             ctx.cool_boost = False
 
-        ctx.boost_fan = feat in ("top", "ironing", "interface", "support", "bottom", "external", "perimeter", "brim", "bridge", "overhang")
+        ctx.boost_fan = feat in FEAT_FAN_BOOST
 
         ctx.apply_pa(feat)
 
-        if feat in ("external", "perimeter", "top", "ironing", "interface", "support", "bottom", "brim"):
+        if feat in FEAT_FAN_TUNE:
             ctx.out.append(ctx.current_line)
-            if feat in ("external", "perimeter"):
+            if feat in FEAT_SEAM:
                 ctx.out.append(ctx.builder.flow_seam(ctx.profile["seam_flow_pct"]))
                 ctx.seam_flow = True
                 ctx.actions.append(f"flow_seam_S{ctx.profile['seam_flow_pct']}")
@@ -1449,14 +1514,14 @@ def transform_layer_boundary(ctx: TransformContext, lines: list[str], idx: int) 
             ctx.restore_layer_fan()
         ctx.reset_flow()
         if LAYER_BEFORE_MARKER in ctx.current_line and LAYER_RETRACT and ctx.layer_count >= 1 and not recent_retract(ctx.out):
-            seam_extra = ctx.surface_kind in ("external", "perimeter")
+            seam_extra = ctx.surface_kind in FEAT_SEAM
             ctx.out.extend(layer_retract_lines(ctx.profile, ctx.builder, seam_extra=seam_extra))
             ctx.actions.append("retract_layer")
             if seam_extra and ctx.profile["seam_extra_retract"] > 0:
                 ctx.actions.append("seam_extra_retract")
         ctx.boost_fan = False
         ctx.cool_boost = False
-        ctx.surface_kind = None
+        ctx.pending_surface_clear = True
         ctx.begin_layer(ctx.current_line)
         return True
     if LAYER_CHANGE_MARKER in ctx.current_line:
@@ -1467,7 +1532,7 @@ def transform_layer_boundary(ctx: TransformContext, lines: list[str], idx: int) 
             ctx.reset_flow()
             ctx.boost_fan = False
             ctx.cool_boost = False
-            ctx.surface_kind = None
+            ctx.pending_surface_clear = True
             ctx.begin_layer(ctx.current_line)
         else:
             ctx.out.append(ctx.current_line)
@@ -1503,15 +1568,16 @@ def transform_fan_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool
 def transform_speed_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool:
     fan_m = FAN_ON_RE.match(ctx.current_line)
     if (
-        ctx.current_upper.startswith("G1")
-        and " E" in ctx.current_upper
+        ctx.current_upper.startswith(("G0", "G1", "G2", "G3"))
         and G1_EXTRUDE_RE.match(ctx.current_line)
         and not fan_m
     ):
+        if ctx.pending_surface_clear:
+            ctx.surface_kind = None
+            ctx.pending_surface_clear = False
         f_cap = speed_cap_for(ctx.surface_kind, ctx.layer_count, ctx.in_startup, ctx.profile)
 
-        # Volumetric Flow Rate Cap Calculation
-        w = ctx.profile.get("nozzle_diameter_mm", NOZZLE_DIAMETER_MM)
+        w = ctx.profile["nozzle_diameter_mm"]
         h = ctx.profile["first_layer_height_mm"] if (ctx.layer_count <= 1 or ctx.in_startup) else ctx.layer_h
         volume_per_mm = w * h
         if volume_per_mm > 0:
@@ -1532,17 +1598,19 @@ def transform_gcode(
     lines: list[str],
     *,
     analysis: GcodeAnalysis,
+    prusa_cfg: dict[str, str] | None = None,
 ) -> tuple[list[str], list[str]]:
     profile = build_e5s1_profile()
     pa_fw = PA_FIRMWARE
     need_sup = analysis["needs_support"]
     skip_overhang_fan = analysis["large"] and analysis["overhang_markers"] > OVERHANG_FAN_SKIP_THRESHOLD and not need_sup
+    cfg = prusa_cfg if prusa_cfg is not None else {}
 
-    head = lines[:head_index(lines)]
+    body_idx = head_index(lines)
     uses_before_after = any(
         marker in line
-        for line in head
-        for marker in (LAYER_BEFORE_MARKER, AFTER_LAYER_MARKER)
+        for line in lines[:body_idx]
+        for marker in LAYER_START_MARKERS
     )
 
     builder = GCodeBuilder(pa_fw)
@@ -1550,7 +1618,7 @@ def transform_gcode(
         profile,
         builder,
         skip_overhang_fan,
-        analysis.get("layer_h"),
+        analysis["layer_h"],
         uses_before_after_markers=uses_before_after,
     )
 
@@ -1584,7 +1652,7 @@ def transform_gcode(
     out = ctx.out
     out, body_start = repair_startup(out, profile, builder, repair_actions)
     out = repair_small_perimeters(out, profile, builder, repair_actions, body_start=body_start)
-    out = repair_layer_marker(out, profile, builder, repair_actions)
+    out = repair_layer_marker(out, builder, repair_actions, cfg)
     ctx.actions.extend(repair_actions)
     out = strip_pp_lines(out)
     out, pa_action = inject_pa(out, pa_fw, profile["pa_k"], builder)
@@ -1606,13 +1674,14 @@ def _export_search_dirs() -> tuple[Path, ...]:
 EXPORT_SEARCH_DIRS = _export_search_dirs()
 
 class RecentExportFinder:
-    def __init__(self) -> None:
-        self.scan_warnings: list[str] = []
-
-    def _warn(self, message: str) -> None:
-        self.scan_warnings.append(message)
-
-    def _recent_gcode_candidates(self, folder: Path, now: float, max_age_s: int, max_files: int) -> list[Path]:
+    def _recent_gcode_candidates(
+        self,
+        folder: Path,
+        now: float,
+        max_age_s: int,
+        max_files: int,
+        warnings: list[str],
+    ) -> list[Path]:
         heap: list[tuple[float, int, Path]] = []
         seq = 0
         try:
@@ -1623,7 +1692,7 @@ class RecentExportFinder:
                     try:
                         mtime = entry.stat().st_mtime
                     except OSError as exc:
-                        self._warn(f"export stat failed {entry.path}: {exc}")
+                        warnings.append(f"export stat failed {entry.path}: {exc}")
                         continue
                     if now - mtime > max_age_s:
                         continue
@@ -1634,25 +1703,29 @@ class RecentExportFinder:
                     elif mtime > heap[0][0]:
                         heapq.heapreplace(heap, item)
         except OSError as exc:
-            self._warn(f"export scan skipped {folder}: {exc}")
+            warnings.append(f"export scan skipped {folder}: {exc}")
             return []
         return [path for _, _, path in sorted(heap, key=lambda item: (-item[0], -item[1]))]
 
-    def find_recent_export(self, max_age_s: int = EXPORT_MAX_AGE_S, max_files: int = EXPORT_MAX_FILES) -> Path | None:
-        self.scan_warnings.clear()
+    def find_recent_export(
+        self,
+        max_age_s: int = EXPORT_MAX_AGE_S,
+        max_files: int = EXPORT_MAX_FILES,
+    ) -> tuple[Path | None, list[str]]:
+        warnings: list[str] = []
         now = time.time()
         for folder in EXPORT_SEARCH_DIRS:
             if not folder.is_dir():
                 continue
-            for candidate in self._recent_gcode_candidates(folder, now, max_age_s, max_files):
+            for candidate in self._recent_gcode_candidates(folder, now, max_age_s, max_files, warnings):
                 try:
                     with candidate.open(encoding="utf-8", errors="replace") as f:
                         if MARKER in f.read(MARKER_HEAD_BYTES):
-                            return candidate
+                            return candidate, warnings
                 except OSError as exc:
-                    self._warn(f"export read failed {candidate}: {exc}")
+                    warnings.append(f"export read failed {candidate}: {exc}")
                     continue
-        return None
+        return None, warnings
 
     def path_note(self, path: Path, argv: list[str] | None = None, export: Path | None = None) -> str:
         note = str(path)
@@ -1762,7 +1835,8 @@ class PostProcessApp:
             hint = " ".join(str(p) for p in [path] if p)
 
             if self.analyzer.is_postprocessed(raw) and not force:
-                analysis = self.analyzer.analyze(raw, hint)
+                prusa_cfg = parse_prusa_config(raw)
+                analysis = self.analyzer.analyze(raw, hint, prusa_cfg=prusa_cfg)
                 errors, warnings = self.validator.validate(raw, expect_postprocess=True, analysis=analysis)
                 self.logger.log_result(
                     "POSTPROCESS SKIP",
@@ -1777,23 +1851,24 @@ class PostProcessApp:
                 code |= bool(errors)
                 continue
 
-            analysis = self.analyzer.analyze(raw, hint)
+            prusa_cfg = parse_prusa_config(raw)
+            analysis = self.analyzer.analyze(raw, hint, prusa_cfg=prusa_cfg)
             lines = strip_pp_lines(raw.splitlines(), full=force)
-            new_lines, actions = transform_gcode(lines, analysis=analysis)
+            new_lines, actions = transform_gcode(lines, analysis=analysis, prusa_cfg=prusa_cfg)
 
             result = "\n".join(new_lines) + "\n"
             path.write_text(result, encoding="utf-8")
 
             export = None
             try:
-                export = self.export_finder.find_recent_export()
-                for warning in self.export_finder.scan_warnings:
+                export, export_warnings = self.export_finder.find_recent_export()
+                for warning in export_warnings:
                     self.logger.log_state_warn(warning, quiet)
                 hint = " ".join(str(p) for p in [path, export] if p)
             except OSError as e:
                 self.logger.log_state_warn(str(e), quiet)
 
-            result_analysis = self.analyzer.analyze(result, hint)
+            result_analysis = self.analyzer.analyze(result, hint, prusa_cfg=prusa_cfg)
             errors, warnings = self.validator.validate(result, expect_postprocess=True, analysis=result_analysis)
             try:
                 state_data = {
