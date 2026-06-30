@@ -245,13 +245,13 @@ DEFAULT_NOZZLE_INFILL_MM_S = 55
 DEFAULT_NOZZLE_CAP_MM_S = 25
 DEFAULT_NOZZLE_DEFAULT_MM_S = 40
 
-DEFAULT_RETRACT_LENGTH_MM = 0.8
+DEFAULT_RETRACT_LENGTH_MM = 1.2
 DEFAULT_RETRACT_SPEED_MM_S = 45.0
 DEFAULT_RETRACT_LIFT_MM = 0.4
 
 DEFAULT_FAN_OFF_LAYERS = 2
 DEFAULT_FAN_RAMP_LAYERS = 2
-DEFAULT_MIN_FAN_PCT = 70
+DEFAULT_MIN_FAN_PCT = 80
 DEFAULT_MAX_FAN_PCT = 100
 DEFAULT_BRIDGE_FAN_PCT = 100
 
@@ -278,8 +278,9 @@ DEFAULT_IRONING_FAN_PCT = 35
 DEFAULT_INTERFACE_FAN_PCT = 78
 DEFAULT_SUPPORT_FAN_PCT = 78
 
-DEFAULT_PA_K = 0.08
-DEFAULT_BUNDLE_PA_K = 0.06
+DEFAULT_PA_K = 0.03
+DEFAULT_BUNDLE_PA_K = 0.03
+DEFAULT_MAX_VOLUMETRIC_FLOW = 15.0
 
 DEFAULT_SKIRT_LOOPS = 3
 DEFAULT_SKIRT_SIDE_MM = 40.0
@@ -334,6 +335,7 @@ class E5S1Profile(TypedDict):
     first_layer_temperature_c: str
     nozzle_diameter_mm: float
     filament_type: str
+    max_volumetric_flow: float
 
 
 def pct_to_pwm(pct: int) -> int:
@@ -439,6 +441,7 @@ def _init_bundle_defaults(bundle: BundleConfig, prusa_cfg: dict[str, str]) -> No
         "pp_skirt_extrusion_mm_per_mm": DEFAULT_SKIRT_EXTRUSION_MM_PER_MM,
         "first_layer_height": DEFAULT_FIRST_LAYER_HEIGHT_MM,
         "first_layer_temperature": int(DEFAULT_FIRST_LAYER_TEMPERATURE_C),
+        "max_volumetric_flow": DEFAULT_MAX_VOLUMETRIC_FLOW,
     }
 
     for key, val in defaults.items():
@@ -606,6 +609,7 @@ def build_e5s1_profile(prusa_cfg: dict[str, str] | None = None, bundle: BundleCo
         "first_layer_temperature_c": str(get_int("first_layer_temperature", int(DEFAULT_FIRST_LAYER_TEMPERATURE_C))),
         "nozzle_diameter_mm": nozzle_diameter,
         "filament_type": filament_type,
+        "max_volumetric_flow": get_float("max_volumetric_flow", DEFAULT_MAX_VOLUMETRIC_FLOW),
     }
 
 # ========================================
@@ -626,6 +630,8 @@ RETRACT_RE = re.compile(r"^G1\b.*\bE-", re.IGNORECASE)
 MOTION_RE = re.compile(r"^[GM]\d", re.IGNORECASE)
 M104_RE = re.compile(r"^M104\s+S(\d+)", re.IGNORECASE)
 M109_RE = re.compile(r"^M109\b", re.IGNORECASE | re.MULTILINE)
+M140_RE = re.compile(r"^M140\b", re.IGNORECASE)
+M190_RE = re.compile(r"^M190\b", re.IGNORECASE)
 M204_S_RE = re.compile(r"^M204\s+S(\d+)", re.IGNORECASE)
 M420_RE = re.compile(r"^M420\b", re.IGNORECASE)
 M900_RE = re.compile(r"^M900\b", re.IGNORECASE | re.MULTILINE)
@@ -1377,6 +1383,7 @@ def _normalize_startup_order(head: list[str]) -> list[str]:
     comments = head[:prefix]
     motion = head[prefix:]
     buckets: dict[str, list[str]] = {
+        "bed_heat": [],
         "g28": [],
         "mesh": [],
         "heat": [],
@@ -1391,7 +1398,9 @@ def _normalize_startup_order(head: list[str]) -> list[str]:
             in_skirt = in_skirt or PP_SKIRT in low
             buckets["skirt"].append(line)
             continue
-        if G28_RE.search(line.strip()):
+        if M140_RE.match(line.strip()) or M190_RE.match(line.strip()):
+            buckets["bed_heat"].append(line)
+        elif G28_RE.search(line.strip()):
             buckets["g28"].append(line)
         elif M420_RE.match(line.strip()) or "postprocess mesh" in low or "bed_mesh" in low:
             buckets["mesh"].append(line)
@@ -1403,6 +1412,7 @@ def _normalize_startup_order(head: list[str]) -> list[str]:
             buckets["other"].append(line)
     return (
         comments
+        + buckets["bed_heat"]
         + buckets["g28"]
         + buckets["mesh"]
         + buckets["heat"]
@@ -1645,10 +1655,11 @@ def inject_pa(lines: list[str], pa_fw: str, pa_k: float, builder: GCodeBuilder |
 # 3. TRANSFORM FUNCTIONS (formerly ILineTransformer)
 # ==========================================
 class TransformContext:
-    def __init__(self, profile: E5S1Profile, builder: GCodeBuilder, skip_overhang_fan: bool):
+    def __init__(self, profile: E5S1Profile, builder: GCodeBuilder, skip_overhang_fan: bool, layer_h: float | None = None):
         self.profile = profile
         self.builder = builder
         self.skip_overhang_fan = skip_overhang_fan
+        self.layer_h = layer_h or 0.4  # Default to 0.4 layer height if none detected
         self.out: list[str] = []
         self.actions: list[str] = []
         self.layer_count = 0
@@ -1759,6 +1770,21 @@ def transform_feature_type(ctx: TransformContext, lines: list[str], idx: int) ->
 
         ctx.boost_fan = feat in ("top", "ironing", "interface", "support", "bottom", "external", "perimeter", "brim", "bridge", "overhang")
 
+        # Dynamically adjust Linear Advance for Marlin
+        if ctx.builder.pa_fw == "marlin" and ctx.profile["pa_k"] > 0:
+            scale = 1.0
+            if feat in ("external", "perimeter"):
+                scale = 0.9  # medium speed
+            elif feat in ("internal", "solid", "infill"):
+                scale = 1.2  # high speed
+            elif feat in ("bridge", "overhang"):
+                scale = 0.5  # low speed
+            elif feat == "ironing":
+                scale = 0.2  # extremely low speed
+            k = round(ctx.profile["pa_k"] * scale, 4)
+            ctx.out.append(ctx.builder.pressure_advance(k))
+            ctx.actions.append(f"pa_dynamic_K{k}")
+
         if feat in ("external", "perimeter", "top", "ironing", "interface", "support", "bottom", "brim"):
             ctx.out.append(ctx.current_line)
             skip_idx = tune_fan_speed(
@@ -1854,19 +1880,30 @@ def transform_fan_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool
 
 def transform_speed_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool:
     fan_m = FAN_ON_RE.match(ctx.current_line)
-    f_cap = speed_cap_for(ctx.surface_kind, ctx.layer_count, ctx.in_startup, ctx.profile)
     if (
         ctx.current_upper.startswith("G1")
         and " E" in ctx.current_upper
         and G1_EXTRUDE_RE.match(ctx.current_line)
         and not fan_m
-        and f_cap is not None
     ):
-        new_line, capped, last_f = cap_f_line(ctx.current_line, f_cap, ctx.last_f, ctx.builder)
-        ctx.out.append(new_line)
-        if capped:
-            ctx.actions.append(f"cap_f_l{ctx.layer_count or 'startup'}")
-        return True
+        f_cap = speed_cap_for(ctx.surface_kind, ctx.layer_count, ctx.in_startup, ctx.profile)
+        
+        # Volumetric Flow Rate Cap Calculation
+        w = ctx.profile.get("nozzle_diameter_mm", 0.8)
+        h = ctx.profile["first_layer_height_mm"] if (ctx.layer_count <= 1 or ctx.in_startup) else ctx.layer_h
+        volume_per_mm = w * h
+        if volume_per_mm > 0:
+            max_speed_mm_s = ctx.profile["max_volumetric_flow"] / volume_per_mm
+            flow_cap_f = int(max_speed_mm_s * 60)
+            if f_cap is None or flow_cap_f < f_cap:
+                f_cap = flow_cap_f
+
+        if f_cap is not None:
+            new_line, capped, last_f = cap_f_line(ctx.current_line, f_cap, ctx.last_f, ctx.builder)
+            ctx.out.append(new_line)
+            if capped:
+                ctx.actions.append(f"cap_flow_l{ctx.layer_count or 'startup'}")
+            return True
     return False
 
 
@@ -1883,7 +1920,7 @@ def transform_gcode(
     skip_overhang_fan = analysis["large"] and analysis["overhang_markers"] > OVERHANG_FAN_SKIP_THRESHOLD and not need_sup
     
     builder = GCodeBuilder(pa_fw)
-    ctx = TransformContext(profile, builder, skip_overhang_fan)
+    ctx = TransformContext(profile, builder, skip_overhang_fan, analysis.get("layer_h"))
     
     transformers = [
         transform_speed_tracking,
