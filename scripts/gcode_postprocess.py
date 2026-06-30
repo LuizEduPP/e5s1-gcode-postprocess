@@ -781,7 +781,7 @@ class GCodeBuilder:
         return f"M221 S{pct} ; postprocess flow bridge"
 
     def z_hop(self, mm: float) -> str:
-        return f"G1 Z{mm} F600 ; postprocess z hop"
+        return f"G91\nG1 Z{mm} F600 ; postprocess z hop\nG90"
 
     def layer_retract(self, mm: float, retract_f: int) -> str:
         return f"G1 E-{mm} F{retract_f} ; postprocess layer retract"
@@ -1503,6 +1503,75 @@ def repair_startup_order_normalization(lines: list[str], profile: E5S1Profile, b
     return normalized_head + lines[h_idx:]
 
 
+def repair_small_perimeters(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
+    segments = []
+    in_perimeter = False
+    curr_seg = []
+    curr_dist = 0.0
+    last_x, last_y = None, None
+    
+    for i, line in enumerate(lines):
+        upper = line.upper()
+        if "TYPE:EXTERNAL PERIMETER" in upper or "TYPE:PERIMETER" in upper:
+            in_perimeter = True
+            curr_seg = []
+            curr_dist = 0.0
+        elif "TYPE:" in upper:
+            in_perimeter = False
+            if curr_seg:
+                segments.append((curr_seg, curr_dist))
+                curr_seg = []
+                
+        if upper.startswith(("G0", "G1")):
+            m_x = X_VAL_RE.search(upper)
+            m_y = Y_VAL_RE.search(upper)
+            m_e = E_VAL_RE.search(upper)
+            
+            x = float(m_x.group(1)) if m_x else last_x
+            y = float(m_y.group(1)) if m_y else last_y
+            
+            is_extrude = bool(m_e and not m_e.group(1).startswith("-") and m_e.group(1) != "0")
+            
+            if in_perimeter and is_extrude:
+                if not curr_seg:
+                    curr_dist = 0.0
+                elif last_x is not None and last_y is not None and x is not None and y is not None:
+                    import math
+                    curr_dist += math.hypot(x - last_x, y - last_y)
+                curr_seg.append(i)
+            elif curr_seg:
+                segments.append((curr_seg, curr_dist))
+                curr_seg = []
+                
+            last_x, last_y = x, y
+            
+    # Filter small perimeters (less than 20mm total distance)
+    small_segments = [seg for seg, dist in segments if 0 < dist < 20.0]
+    
+    if not small_segments:
+        return lines
+        
+    out = list(lines)
+    for seg in reversed(small_segments):
+        start_idx = seg[0]
+        end_idx = seg[-1]
+        
+        out.insert(end_idx + 1, "M221 S100 ; postprocess small perimeter flow reset")
+        
+        line_start = out[start_idx]
+        if F_RE.search(line_start):
+            line_start = F_RE.sub("F900", line_start)
+        else:
+            line_start += " F900"
+        line_start += " ; postprocess small perimeter speed cap"
+        out[start_idx] = line_start
+        
+        out.insert(start_idx, "M221 S105 ; postprocess small perimeter flow boost")
+
+    actions.append(f"small_perimeters_fixed×{len(small_segments)}")
+    return out
+
+
 def repair_layer_marker(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
     body = "\n".join(lines)
     if body.count(LAYER_BEFORE_MARKER) == 0 and body.count(AFTER_LAYER_MARKER) > 0:
@@ -1537,6 +1606,7 @@ def repair_gcode(lines: list[str], profile: E5S1Profile, pa_fw: str = "marlin") 
         repair_purge_line,
         repair_z_fix,
         repair_skirt_injection,
+        repair_small_perimeters,
         repair_startup_order_normalization,
         repair_layer_marker,
     ]
