@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TypedDict
@@ -13,18 +12,8 @@ import re
 import sys
 import time
 
-
-
-# ========================================
-# MERGED FROM: config.py
-# ========================================
-
 """E5S1 infrastructure constants, bundle.ini loader, and profile builder settings."""
 
-
-# ==========================================
-# 1. CONSTANTS (formerly config.py)
-# ==========================================
 PROJECT = Path(__file__).resolve().parent.parent
 LOG_DIR = PROJECT / "logs"
 STATE_FILE = LOG_DIR / "e5s1_state.json"
@@ -55,7 +44,6 @@ SUPPORT_OVERHANG_MIN = 1
 
 ENABLE_MESH_ON_START = "M420 S1 Z10 ; postprocess mesh"
 
-
 INVALID_MACRO_SNIPPET = "first_layer_height[0]"
 THUMBNAIL_BEGIN = "; thumbnail begin"
 THUMBNAIL_END = "; thumbnail end"
@@ -81,7 +69,6 @@ TYPE_SKIRT_BRIM = ";TYPE:Skirt/Brim"
 
 PRESERVE_GEOMETRY_FEATURES = frozenset({"top", "bottom"})
 
-# Hardcoded thresholds, limits and scan windows
 BED_X_MIN = 2.0
 BED_X_MAX = 218.0
 BED_Y_MIN = 2.0
@@ -94,18 +81,15 @@ PEEK_SLICER_FAN_WINDOW = 24
 PEEK_RETRACT_WINDOW = 8
 OVERHANG_FAN_SKIP_THRESHOLD = 40
 
-# Small Perimeter Tuning Constants
 SMALL_PERIMETER_THRESHOLD_MM = 20.0
 SMALL_PERIMETER_SPEED_CAP_F = 900
 SMALL_PERIMETER_FLOW_BOOST_PCT = 105
 
-# Dynamic Linear Advance Scale Factors
 PA_INFILL_SCALE = 1.2
 PA_PERIMETER_SCALE = 0.9
 PA_BRIDGE_SCALE = 0.5
 PA_IRONING_SCALE = 0.2
 
-# Configuration Key Constants
 KEY_IRONING = "ironing"
 KEY_TOP_SOLID_INFILL_PATTERN = "top_solid_infill_pattern"
 KEY_LAYER_HEIGHT = "layer_height"
@@ -148,10 +132,6 @@ KEY_FIRST_LAYER_TEMPERATURE = "first_layer_temperature"
 KEY_MAX_VOLUMETRIC_FLOW = "max_volumetric_flow"
 ENV_E5S1_EXPORT_DIR = "E5S1_EXPORT_DIR"
 
-
-# ==========================================
-# 2. CONFIG LOADER (formerly bundle_config.py)
-# ==========================================
 def _auto_cast(value: str) -> Any:
     """Cast string to appropriate type (int/float/bool/str)."""
     value = value.strip()
@@ -167,7 +147,6 @@ def _auto_cast(value: str) -> Any:
             return float(value)
         except ValueError:
             return value
-
 
 class BundleConfig:
     def __init__(self, path: Path | str | None = None):
@@ -260,7 +239,6 @@ class BundleConfig:
         if auto_save:
             self.save()
 
-
 class BundleConfigFactory:
     _instance: BundleConfig | None = None
 
@@ -270,14 +248,9 @@ class BundleConfigFactory:
             cls._instance = BundleConfig()
         return cls._instance
 
-
 def get_bundle_config() -> BundleConfig:
     return BundleConfigFactory.get_instance()
 
-
-# ==========================================
-# 3. PROFILE (formerly profile.py)
-# ==========================================
 CUSTOM_PARAM_KEYS = (
     "custom_parameters_print",
     "custom_parameters_filament",
@@ -334,10 +307,8 @@ DEFAULT_SKIRT_ORIGIN_Y_MM = 3.0
 DEFAULT_SKIRT_LOOP_OFFSET_MM = 2.0
 DEFAULT_SKIRT_EXTRUSION_MM_PER_MM = 0.1
 
-
 class ProfileConfigError(ValueError):
     pass
-
 
 class E5S1Profile(TypedDict):
     retract_mm: float
@@ -382,14 +353,11 @@ class E5S1Profile(TypedDict):
     filament_type: str
     max_volumetric_flow: float
 
-
 def pct_to_pwm(pct: int) -> int:
     return max(0, min(255, int(255 * pct / 100)))
 
-
 def resolve_pa_firmware(gcode_sample: str = "") -> str:
     return "marlin"
-
 
 def _parse_custom_parameters(raw: str) -> dict[str, str]:
     out: dict[str, str] = {}
@@ -402,13 +370,11 @@ def _parse_custom_parameters(raw: str) -> dict[str, str]:
             out[key.strip()] = val.strip()
     return out
 
-
 def _merge_custom_parameters(cfg: dict[str, str]) -> dict[str, str]:
     merged = dict(cfg)
     for key in CUSTOM_PARAM_KEYS:
         merged.update(_parse_custom_parameters(cfg.get(key, "")))
     return merged
-
 
 def parse_prusa_config(text: str) -> dict[str, str]:
     tail = text[-PRUSA_CONFIG_SCAN_BYTES:] if len(text) > PRUSA_CONFIG_SCAN_BYTES else text
@@ -430,7 +396,6 @@ def parse_prusa_config(text: str) -> dict[str, str]:
         key, val = body.split(" = ", 1)
         out[key.strip()] = val.strip()
     return _merge_custom_parameters(out)
-
 
 def _init_bundle_defaults(bundle: BundleConfig, prusa_cfg: dict[str, str]) -> None:
     # First, sync known keys from prusa_cfg if not already set in bundle
@@ -481,7 +446,6 @@ def _init_bundle_defaults(bundle: BundleConfig, prusa_cfg: dict[str, str]) -> No
     for key, val in defaults.items():
         if val is not None and not bundle.has(key):
             bundle.set(key, val)
-
 
 def build_e5s1_profile(prusa_cfg: dict[str, str] | None = None, bundle: BundleConfig | None = None) -> E5S1Profile:
     prusa_cfg = _merge_custom_parameters(prusa_cfg or {})
@@ -625,16 +589,6 @@ def build_e5s1_profile(prusa_cfg: dict[str, str] | None = None, bundle: BundleCo
         "max_volumetric_flow": get_float(KEY_MAX_VOLUMETRIC_FLOW, DEFAULT_MAX_VOLUMETRIC_FLOW),
     }
 
-# ========================================
-# MERGED FROM: gcode_utils.py
-# ========================================
-
-
-
-
-# ==========================================
-# 1. PATTERNS & REGEX (formerly gcode_patterns.py)
-# ==========================================
 F_RE = re.compile(r"F(\d+)", re.IGNORECASE)
 FAN_ON_RE = re.compile(r"^M106\s+S(\d+)", re.IGNORECASE)
 PP_FAN_RE = re.compile(r"^M106\s+S\d+\s*;.*postprocess", re.IGNORECASE | re.MULTILINE)
@@ -676,7 +630,6 @@ def count_layers(text: str, prusa_cfg: dict[str, str] | None = None) -> int:
             return int(prusa_cfg[key])
     return 0
 
-
 def has_skirt_or_brim(text: str) -> tuple[bool, bool]:
     low = text[:120000].lower()
     has_skirt = any(
@@ -685,7 +638,6 @@ def has_skirt_or_brim(text: str) -> tuple[bool, bool]:
     )
     has_brim = TYPE_BRIM.lower() in low or TYPE_OUTER_BRIM.lower() in low
     return has_skirt, has_brim
-
 
 def is_pp_line(line: str, *, pa_only: bool = False) -> bool:
     stripped = line.strip()
@@ -698,14 +650,10 @@ def is_pp_line(line: str, *, pa_only: bool = False) -> bool:
         return True
     return bool(";" in stripped and "postprocess" in stripped.split(";", 1)[1].lower())
 
-
 def strip_pp_lines(lines: list[str], full: bool = False) -> list[str]:
     return [ln for ln in lines if not is_pp_line(ln, pa_only=not full)]
 
-
-# Singleton feature scanner — reused across all transform calls
 _FEATURE_SCANNER = None
-
 
 def get_feature_scanner() -> "GCodeFeatureScanner":
     global _FEATURE_SCANNER
@@ -713,10 +661,6 @@ def get_feature_scanner() -> "GCodeFeatureScanner":
         _FEATURE_SCANNER = GCodeFeatureScanner()
     return _FEATURE_SCANNER
 
-
-# ==========================================
-# 2. FEATURE CLASSIFICATION (formerly gcode_features.py)
-# ==========================================
 class GCodeFeatureScanner:
     def type_feature(self, line: str) -> str | None:
         if TYPE_IRONING in line:
@@ -749,16 +693,10 @@ class GCodeFeatureScanner:
             return "other"
         return None
 
-
 def preserves_geometry(kind: str | None) -> bool:
     return kind in PRESERVE_GEOMETRY_FEATURES
 
-
-# ==========================================
-# 3. EMITTERS (formerly gcode_emit.py)
-# ==========================================
 PP_SKIRT = "postprocess skirt"
-
 
 class MarlinGCodeEmitter:
     def mesh_enable(self) -> str:
@@ -766,7 +704,6 @@ class MarlinGCodeEmitter:
 
     def pressure_advance(self, pa_k: float) -> str:
         return f"M900 K{pa_k} ; linear advance postprocess"
-
 
 class GCodeBuilder:
     def __init__(self, pa_fw: str = "marlin"):
@@ -858,10 +795,6 @@ G92 E0 ; postprocess purge"""
     def pressure_advance(self, pa_k: float) -> str:
         return self.emitter.pressure_advance(pa_k)
 
-
-# ==========================================
-# 4. ANALYSIS & VALIDATION (formerly gcode_checks.py)
-# ==========================================
 _STAT_FIELDS = (
     "overhang_markers",
     "has_support",
@@ -877,7 +810,6 @@ _STAT_FIELDS = (
     "layer_h",
     "est_seconds",
 )
-
 
 class GcodeAnalysis(TypedDict):
     overhang_markers: int
@@ -897,7 +829,6 @@ class GcodeAnalysis(TypedDict):
     slicer_time: str | None
     lines: int
     large: bool
-
 
 class GCodeAnalyzer:
     def _slicer_print_time(self, text: str) -> str | None:
@@ -1040,7 +971,6 @@ class GCodeAnalyzer:
             **{k: a[k] for k in _STAT_FIELDS},
         }
 
-
 class GCodeValidator:
     def __init__(self, analyzer: GCodeAnalyzer | None = None):
         self.analyzer = analyzer or GCodeAnalyzer()
@@ -1107,22 +1037,11 @@ class GCodeValidator:
 
         return errors, warnings
 
-# ========================================
-# MERGED FROM: gcode_process.py
-# ========================================
-
-
-
-
 BED_MESH_RE = re.compile(r"BED_MESH", re.I)
 X_VAL_RE = re.compile(r"\b[Xx]([\d.-]+)")
 Y_VAL_RE = re.compile(r"\b[Yy]([\d.-]+)")
 E_VAL_RE = re.compile(r"\b[Ee]([\d.-]+)")
 
-
-# ==========================================
-# 1. TUNING FUNCTIONS (formerly Tuner classes)
-# ==========================================
 def cap_f_line(line: str, cap: int, last_f: int, builder: GCodeBuilder) -> tuple[str, bool, int]:
     m = F_RE.search(line)
     if m:
@@ -1133,7 +1052,6 @@ def cap_f_line(line: str, cap: int, last_f: int, builder: GCodeBuilder) -> tuple
     if last_f <= cap:
         return line, False, last_f
     return line + f" F{cap}{builder.cap_f_suffix()}", True, cap
-
 
 def speed_cap_for(
     kind: str | None,
@@ -1154,14 +1072,12 @@ def speed_cap_for(
         return min(profile["max_infill_f"], ceiling)
     return None
 
-
 def layer_retract_lines(profile: E5S1Profile, builder: GCodeBuilder) -> list[str]:
     lines: list[str] = []
     if profile["retract_lift"] > 0:
         lines.append(builder.z_hop(profile["retract_lift"]))
     lines.append(builder.layer_retract(profile["retract_mm"], profile["retract_f"]))
     return lines
-
 
 def recent_retract(out: list[str], window: int = PEEK_RETRACT_WINDOW, *, seam: bool = False) -> bool:
     for line in out[-window:]:
@@ -1177,7 +1093,6 @@ def recent_retract(out: list[str], window: int = PEEK_RETRACT_WINDOW, *, seam: b
             return True
     return False
 
-
 def peek_slicer_fan(lines: list[str], idx: int, window: int = PEEK_SLICER_FAN_WINDOW) -> tuple[int | None, int | None]:
     end = min(idx + 1 + window, len(lines))
     for j in range(idx + 1, end):
@@ -1188,7 +1103,6 @@ def peek_slicer_fan(lines: list[str], idx: int, window: int = PEEK_SLICER_FAN_WI
         if upper.startswith(("G0", "G1")) and " E" in upper:
             break
     return None, None
-
 
 def e5s1_fan_target_label(kind: str, layer_count: int, layer_fan_cap: int | None, profile: E5S1Profile) -> tuple[int, str] | None:
     pwm_keys = {
@@ -1207,7 +1121,6 @@ def e5s1_fan_target_label(kind: str, layer_count: int, layer_fan_cap: int | None
         return (layer_fan_cap if layer_fan_cap is not None else 0), "adhesion"
     return None
 
-
 def tune_fan_speed(out: list[str], actions: list[str], kind: str, lines: list[str], idx: int, layer_count: int, layer_fan_cap: int | None, profile: E5S1Profile, builder: GCodeBuilder) -> int | None:
     slicer_fan, fan_idx = peek_slicer_fan(lines, idx)
     target = e5s1_fan_target_label(kind, layer_count, layer_fan_cap, profile)
@@ -1222,7 +1135,6 @@ def tune_fan_speed(out: list[str], actions: list[str], kind: str, lines: list[st
         return fan_idx
     return None
 
-
 def fan_pwm_for_layer(layer: int, profile: E5S1Profile) -> int | None:
     off = profile["fan_off_layers"]
     ramp_end = profile["full_fan_layer"] - 1
@@ -1235,17 +1147,12 @@ def fan_pwm_for_layer(layer: int, profile: E5S1Profile) -> int | None:
         return min(pwm, profile["max_fan_pwm"])
     return None
 
-
 def sanitize_startup_line(line: str, first_layer_height_mm: float) -> tuple[str | None, str | None]:
     stripped = line.rstrip("\n\r")
     if INVALID_MACRO_SNIPPET in stripped:
         return stripped.replace(INVALID_MACRO_SNIPPET, str(first_layer_height_mm)), "macro_fixed"
     return stripped, None
 
-
-# ==========================================
-# 2. REPAIR FUNCTIONS (formerly IRepairStep)
-# ==========================================
 def head_index(lines: list[str]) -> int:
     return next(
         (
@@ -1255,7 +1162,6 @@ def head_index(lines: list[str]) -> int:
         ),
         min(len(lines), PA_PROBE_LINES),
     )
-
 
 def scan_bounding_box(lines: list[str]) -> tuple[float, float, float, float] | None:
     min_x = min_y = float("inf")
@@ -1288,7 +1194,6 @@ def scan_bounding_box(lines: list[str]) -> tuple[float, float, float, float] | N
     if has_moves:
         return min_x, min_y, max_x, max_y
     return None
-
 
 def generate_contour_skirt(profile: E5S1Profile, bbox: tuple[float, float, float, float] | None, builder: GCodeBuilder) -> list[str]:
     z_val = profile["first_layer_height_mm"]
@@ -1333,7 +1238,6 @@ def generate_contour_skirt(profile: E5S1Profile, bbox: tuple[float, float, float
     lines.append(builder.skirt_reset_e())
     return lines
 
-
 def _fix_z_line(line: str, target: float, builder: GCodeBuilder) -> tuple[str, bool]:
     m = Z_MOVE_RE.match(line.strip())
     if not m:
@@ -1343,13 +1247,11 @@ def _fix_z_line(line: str, target: float, builder: GCodeBuilder) -> tuple[str, b
         return re.sub(r"(\bZ)([\d.]+)", rf"\g<1>{target}", line, count=1, flags=re.I) + builder.z_fix_suffix(), True
     return line, False
 
-
 def _comment_prefix_len(lines: list[str]) -> int:
     for i, line in enumerate(lines):
         if MOTION_RE.match(line.strip()):
             return i
     return len(lines)
-
 
 def _line_index(lines: list[str], pattern: re.Pattern[str]) -> int | None:
     for i, line in enumerate(lines):
@@ -1357,12 +1259,10 @@ def _line_index(lines: list[str], pattern: re.Pattern[str]) -> int | None:
             return i
     return None
 
-
 def _insert_after(lines: list[str], idx: int | None, line: str) -> None:
     insert_idx = (idx + 1) if idx is not None else _comment_prefix_len(lines)
     for part in reversed(line.split("\n")):
         lines.insert(insert_idx, part)
-
 
 def _insert_skirt_block(head: list[str], block: list[str]) -> list[str]:
     idx = len(head)
@@ -1372,7 +1272,6 @@ def _insert_skirt_block(head: list[str], block: list[str]) -> list[str]:
         elif M109_RE.match(line.strip()):
             idx = max(idx, i + 1)
     return head[:idx] + block + head[idx:]
-
 
 def _normalize_startup_order(head: list[str]) -> list[str]:
     prefix = _comment_prefix_len(head)
@@ -1417,8 +1316,6 @@ def _normalize_startup_order(head: list[str]) -> list[str]:
         + buckets["other"]
     )
 
-
-# Individual Repair Steps (Functional)
 def repair_homing(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
     h_idx = head_index(lines)
     head = list(lines[:h_idx])
@@ -1427,7 +1324,6 @@ def repair_homing(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder,
         actions.append("g28_added")
         return head + lines[h_idx:]
     return lines
-
 
 def repair_mesh_leveling(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
     h_idx = head_index(lines)
@@ -1440,7 +1336,6 @@ def repair_mesh_leveling(lines: list[str], profile: E5S1Profile, builder: GCodeB
         actions.append("mesh_enabled")
         return head + lines[h_idx:]
     return lines
-
 
 def repair_wait_hotend(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
     h_idx = head_index(lines)
@@ -1457,7 +1352,6 @@ def repair_wait_hotend(lines: list[str], profile: E5S1Profile, builder: GCodeBui
         return head + lines[h_idx:]
     return lines
 
-
 def repair_purge_line(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
     h_idx = head_index(lines)
     head = list(lines[:h_idx])
@@ -1469,7 +1363,6 @@ def repair_purge_line(lines: list[str], profile: E5S1Profile, builder: GCodeBuil
         actions.append("purge_added")
         return head + lines[h_idx:]
     return lines
-
 
 def repair_z_fix(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
     h_idx = head_index(lines)
@@ -1486,7 +1379,6 @@ def repair_z_fix(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, 
         return fixed_head + lines[h_idx:]
     return lines
 
-
 def repair_skirt_injection(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
     h_idx = head_index(lines)
     head = list(lines[:h_idx])
@@ -1501,13 +1393,11 @@ def repair_skirt_injection(lines: list[str], profile: E5S1Profile, builder: GCod
         return head + tail
     return lines
 
-
 def repair_startup_order_normalization(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
     h_idx = head_index(lines)
     head = list(lines[:h_idx])
     normalized_head = _normalize_startup_order(head)
     return normalized_head + lines[h_idx:]
-
 
 def repair_small_perimeters(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
     segments = []
@@ -1515,7 +1405,7 @@ def repair_small_perimeters(lines: list[str], profile: E5S1Profile, builder: GCo
     curr_seg = []
     curr_dist = 0.0
     last_x, last_y = None, None
-    
+
     for i, line in enumerate(lines):
         upper = line.upper()
         if "TYPE:EXTERNAL PERIMETER" in upper or "TYPE:PERIMETER" in upper:
@@ -1527,17 +1417,17 @@ def repair_small_perimeters(lines: list[str], profile: E5S1Profile, builder: GCo
             if curr_seg:
                 segments.append((curr_seg, curr_dist))
                 curr_seg = []
-                
+
         if upper.startswith(("G0", "G1")):
             m_x = X_VAL_RE.search(upper)
             m_y = Y_VAL_RE.search(upper)
             m_e = E_VAL_RE.search(upper)
-            
+
             x = float(m_x.group(1)) if m_x else last_x
             y = float(m_y.group(1)) if m_y else last_y
-            
+
             is_extrude = bool(m_e and not m_e.group(1).startswith("-") and m_e.group(1) != "0")
-            
+
             if in_perimeter and is_extrude:
                 if not curr_seg:
                     curr_dist = 0.0
@@ -1548,22 +1438,22 @@ def repair_small_perimeters(lines: list[str], profile: E5S1Profile, builder: GCo
             elif curr_seg:
                 segments.append((curr_seg, curr_dist))
                 curr_seg = []
-                
+
             last_x, last_y = x, y
-            
+
     # Filter small perimeters (less than threshold distance)
     small_segments = [seg for seg, dist in segments if 0 < dist < SMALL_PERIMETER_THRESHOLD_MM]
-    
+
     if not small_segments:
         return lines
-        
+
     out = list(lines)
     for seg in reversed(small_segments):
         start_idx = seg[0]
         end_idx = seg[-1]
-        
+
         out.insert(end_idx + 1, "M221 S100 ; postprocess small perimeter flow reset")
-        
+
         line_start = out[start_idx]
         if F_RE.search(line_start):
             line_start = F_RE.sub(f"F{SMALL_PERIMETER_SPEED_CAP_F}", line_start)
@@ -1571,12 +1461,11 @@ def repair_small_perimeters(lines: list[str], profile: E5S1Profile, builder: GCo
             line_start += f" F{SMALL_PERIMETER_SPEED_CAP_F}"
         line_start += " ; postprocess small perimeter speed cap"
         out[start_idx] = line_start
-        
+
         out.insert(start_idx, f"M221 S{SMALL_PERIMETER_FLOW_BOOST_PCT} ; postprocess small perimeter flow boost")
 
     actions.append(f"small_perimeters_fixed×{len(small_segments)}")
     return out
-
 
 def repair_layer_marker(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
     body = "\n".join(lines)
@@ -1600,11 +1489,10 @@ def repair_layer_marker(lines: list[str], profile: E5S1Profile, builder: GCodeBu
         return patched
     return lines
 
-
 def repair_gcode(lines: list[str], profile: E5S1Profile, pa_fw: str = "marlin") -> tuple[list[str], list[str]]:
     actions: list[str] = []
     builder = GCodeBuilder(pa_fw)
-    
+
     steps = [
         repair_homing,
         repair_mesh_leveling,
@@ -1616,13 +1504,12 @@ def repair_gcode(lines: list[str], profile: E5S1Profile, pa_fw: str = "marlin") 
         repair_startup_order_normalization,
         repair_layer_marker,
     ]
-    
+
     out = list(lines)
     for step in steps:
         out = step(out, profile, builder, actions)
-        
-    return out, actions
 
+    return out, actions
 
 def inject_pa(lines: list[str], pa_fw: str, pa_k: float, builder: GCodeBuilder | None = None) -> tuple[list[str], str | None]:
     if not pa_k or pa_fw == "none":
@@ -1644,10 +1531,6 @@ def inject_pa(lines: list[str], pa_fw: str, pa_k: float, builder: GCodeBuilder |
     cmd = builder.pressure_advance(pa_k)
     return lines[:extrusion_idx + 1] + [cmd] + lines[extrusion_idx + 1:], f"pa_{pa_fw}_{pa_k}"
 
-
-# ==========================================
-# 3. TRANSFORM FUNCTIONS (formerly ILineTransformer)
-# ==========================================
 class TransformContext:
     def __init__(self, profile: E5S1Profile, builder: GCodeBuilder, skip_overhang_fan: bool, layer_h: float | None = None):
         self.profile = profile
@@ -1706,13 +1589,10 @@ class TransformContext:
             self.actions.append(f"accel_default_l{self.layer_count}")
         self.layer_fan_cap = cap
 
-
-# Transformer functions returning True if handeled
 def transform_speed_tracking(ctx: TransformContext, lines: list[str], idx: int) -> bool:
     if ctx.current_upper.startswith(("G0", "G1")) and (fm := F_RE.search(ctx.current_line)):
         ctx.last_f = int(fm.group(1))
     return False
-
 
 def transform_startup_line(ctx: TransformContext, lines: list[str], idx: int) -> bool:
     if ctx.in_startup:
@@ -1725,14 +1605,12 @@ def transform_startup_line(ctx: TransformContext, lines: list[str], idx: int) ->
             ctx.update_line(fixed)
     return False
 
-
 def transform_header(ctx: TransformContext, lines: list[str], idx: int) -> bool:
     if ctx.current_line.startswith("; generated by"):
         ctx.out += [ctx.current_line, ctx.builder.timestamp(datetime.now().isoformat(timespec="seconds")), MARKER]
         ctx.actions.append("header")
         return True
     return False
-
 
 def transform_feature_type(ctx: TransformContext, lines: list[str], idx: int) -> bool:
     feat = get_feature_scanner().type_feature(ctx.current_line)
@@ -1787,7 +1665,7 @@ def transform_feature_type(ctx: TransformContext, lines: list[str], idx: int) ->
                 ctx.skip_fan_at.add(skip_idx)
             ctx.surface_kind = feat
             return True
-        
+
         if feat == "other":
             ctx.surface_kind = None
             ctx.boost_fan = False
@@ -1796,9 +1674,8 @@ def transform_feature_type(ctx: TransformContext, lines: list[str], idx: int) ->
         ctx.out.append(ctx.current_line)
         ctx.surface_kind = feat
         return True
-    
-    return False
 
+    return False
 
 def transform_ironing_fan(ctx: TransformContext, lines: list[str], idx: int) -> bool:
     fan_m = FAN_ON_RE.match(ctx.current_line)
@@ -1811,7 +1688,6 @@ def transform_ironing_fan(ctx: TransformContext, lines: list[str], idx: int) -> 
             ctx.out.append(ctx.current_line)
         return True
     return False
-
 
 def transform_layer_boundary(ctx: TransformContext, lines: list[str], idx: int) -> bool:
     if LAYER_BEFORE_MARKER in ctx.current_line or AFTER_LAYER_MARKER in ctx.current_line:
@@ -1842,7 +1718,6 @@ def transform_layer_boundary(ctx: TransformContext, lines: list[str], idx: int) 
         return True
     return False
 
-
 def transform_accel_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool:
     if (m204_m := M204_S_RE.match(ctx.current_line) if 1 <= ctx.layer_count <= M204_CAP_LAYERS else None):
         cap_accel = ctx.profile["first_layer_accel"]
@@ -1857,7 +1732,6 @@ def transform_accel_cap(ctx: TransformContext, lines: list[str], idx: int) -> bo
         return True
     return False
 
-
 def transform_fan_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool:
     fan_m = FAN_ON_RE.match(ctx.current_line)
     if ctx.in_startup and fan_m and int(fan_m.group(1)) > 0:
@@ -1870,7 +1744,6 @@ def transform_fan_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool
         return True
     return False
 
-
 def transform_speed_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool:
     fan_m = FAN_ON_RE.match(ctx.current_line)
     if (
@@ -1880,7 +1753,7 @@ def transform_speed_cap(ctx: TransformContext, lines: list[str], idx: int) -> bo
         and not fan_m
     ):
         f_cap = speed_cap_for(ctx.surface_kind, ctx.layer_count, ctx.in_startup, ctx.profile)
-        
+
         # Volumetric Flow Rate Cap Calculation
         w = ctx.profile.get("nozzle_diameter_mm", 0.8)
         h = ctx.profile["first_layer_height_mm"] if (ctx.layer_count <= 1 or ctx.in_startup) else ctx.layer_h
@@ -1899,7 +1772,6 @@ def transform_speed_cap(ctx: TransformContext, lines: list[str], idx: int) -> bo
             return True
     return False
 
-
 def transform_gcode(
     lines: list[str],
     *,
@@ -1911,10 +1783,10 @@ def transform_gcode(
     pa_fw = resolve_pa_firmware("\n".join(lines[:PA_PROBE_LINES]))
     need_sup = analysis["needs_support"]
     skip_overhang_fan = analysis["large"] and analysis["overhang_markers"] > OVERHANG_FAN_SKIP_THRESHOLD and not need_sup
-    
+
     builder = GCodeBuilder(pa_fw)
     ctx = TransformContext(profile, builder, skip_overhang_fan, analysis.get("layer_h"))
-    
+
     transformers = [
         transform_speed_tracking,
         transform_startup_line,
@@ -1926,7 +1798,7 @@ def transform_gcode(
         transform_fan_cap,
         transform_speed_cap,
     ]
-    
+
     for i, line in enumerate(lines):
         if i in ctx.skip_fan_at:
             continue
@@ -1937,7 +1809,7 @@ def transform_gcode(
             if transformer(ctx, lines, i):
                 handled = True
                 break
-        
+
         if not handled:
             ctx.out.append(ctx.current_line)
 
@@ -1953,17 +1825,6 @@ def transform_gcode(
         ctx.actions.append("support_cooling")
     return out, ctx.actions
 
-# ========================================
-# MERGED FROM: gcode_pipeline.py
-# ========================================
-
-
-
-
-
-# ==========================================
-# 1. EXPORT DISCOVERY & SEARCH PATHS
-# ==========================================
 def _export_search_dirs() -> tuple[Path, ...]:
     dirs = [
         Path.home() / "Downloads",
@@ -1975,9 +1836,7 @@ def _export_search_dirs() -> tuple[Path, ...]:
         dirs.append(Path(extra))
     return tuple(dirs)
 
-
 EXPORT_SEARCH_DIRS = _export_search_dirs()
-
 
 class IExportFinder(abc.ABC):
     @abc.abstractmethod
@@ -1987,7 +1846,6 @@ class IExportFinder(abc.ABC):
     @abc.abstractmethod
     def path_note(self, path: Path, argv: list[str] | None = None, export: Path | None = None) -> str:
         pass
-
 
 class RecentExportFinder(IExportFinder):
     def _recent_gcode_candidates(self, folder: Path, now: float, max_age_s: int, max_files: int) -> list[Path]:
@@ -2041,10 +1899,6 @@ class RecentExportFinder(IExportFinder):
             note += f" | argv_extra={argv[1:]}"
         return note
 
-
-# ==========================================
-# 2. LOGGING UTILITIES
-# ==========================================
 class IStateLogger(abc.ABC):
     @abc.abstractmethod
     def log(self, event: str, message: str = "", echo: bool = True) -> None:
@@ -2053,7 +1907,6 @@ class IStateLogger(abc.ABC):
     @abc.abstractmethod
     def write_state(self, data: dict) -> None:
         pass
-
 
 class StateLogger(IStateLogger):
     def __init__(self):
@@ -2074,7 +1927,6 @@ class StateLogger(IStateLogger):
         self._ensure_log_dir()
         STATE_FILE.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
-
 class LoggerFactory:
     _instance: IStateLogger | None = None
 
@@ -2084,10 +1936,6 @@ class LoggerFactory:
             cls._instance = StateLogger()
         return cls._instance
 
-
-# ==========================================
-# 3. PIPELINE ORCHESTRATION
-# ==========================================
 class ILogger(abc.ABC):
     @abc.abstractmethod
     def log_result(
@@ -2114,7 +1962,6 @@ class ILogger(abc.ABC):
     @abc.abstractmethod
     def format_actions(self, actions: list[str]) -> str:
         pass
-
 
 class DefaultLogger(ILogger):
     def __init__(self, state_logger: IStateLogger, analyzer: GCodeAnalyzer):
@@ -2159,7 +2006,6 @@ class DefaultLogger(ILogger):
     def log_fail(self, note: str, quiet: bool) -> None:
         self.state_logger.log("POSTPROCESS FAIL", note, echo=not quiet)
 
-
 class PostProcessApp:
     def __init__(
         self,
@@ -2181,7 +2027,7 @@ class PostProcessApp:
 
     def run(self, paths: list[Path], quiet: bool = False, force: bool = False, argv: list[str] | None = None) -> int:
         code = 0
-            
+
         for path in paths:
             start = time.monotonic()
             if not path.is_file():
@@ -2258,7 +2104,6 @@ class PostProcessApp:
             code |= bool(errors)
         return code
 
-
 def run_postprocess(
     paths: list[Path],
     quiet: bool = False,
@@ -2268,15 +2113,7 @@ def run_postprocess(
     app = PostProcessApp()
     return app.run(paths, quiet, force, argv)
 
-# ========================================
-# MERGED FROM: gcode_postprocess.py
-# ========================================
-
-#!/usr/bin/env python3
-
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 
 if __name__ == "__main__":
     argv = sys.argv[1:]
