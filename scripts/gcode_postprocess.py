@@ -2,17 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TypedDict
-import abc
-import configparser
+from typing import TypedDict
 import heapq
 import json
+import math
 import os
 import re
 import sys
 import time
 
-"""E5S1 infrastructure constants, bundle.ini loader, and profile builder settings."""
+"""E5S1 G-code post-processor — constants, profile, transform pipeline, and CLI."""
 
 PROJECT = Path(__file__).resolve().parent.parent
 LOG_DIR = PROJECT / "logs"
@@ -20,6 +19,7 @@ STATE_FILE = LOG_DIR / "e5s1_state.json"
 LOG_FILE = LOG_DIR / "e5s1_events.log"
 
 MARKER = "; --- E5S1 postprocess ---"
+PP_SKIRT = "postprocess skirt"
 LAYER_BEFORE_MARKER = ";BEFORE_LAYER_CHANGE"
 LAYER_CHANGE_MARKER = ";LAYER_CHANGE"
 AFTER_LAYER_MARKER = ";AFTER_LAYER_CHANGE"
@@ -27,26 +27,38 @@ LAYER_N_MARKER = ";LAYER:"
 
 HEAD_SCAN_BYTES = 8000
 SLICER_META_SCAN_BYTES = 32000
-MARKER_HEAD_BYTES = max(4096, len(MARKER) + 64)
+MARKER_HEAD_MIN_BYTES = 4096
+MARKER_HEAD_BYTES = max(MARKER_HEAD_MIN_BYTES, len(MARKER) + 64)
 PA_PROBE_LINES = 800
 LARGE_GCODE_BYTES = 2 * 1024 * 1024
 METADATA_SCAN_BYTES = 8 * 1024 * 1024
+METADATA_MAX_COMMENT_LINES = 100_000
+SKIRT_BRIM_SCAN_CHARS = 120_000
+BBOX_SCAN_LIMIT = 100_000
+PRUSA_CONFIG_SCAN_BYTES = 512 * 1024
 
 PRUSA_CONFIG_BEGIN = "; prusaslicer_config = begin"
 PRUSA_CONFIG_END = "; prusaslicer_config = end"
-PRUSA_CONFIG_SCAN_BYTES = 512 * 1024
+PRUSA_KEY_IRONING = "ironing"
+PRUSA_KEY_TOP_SOLID_INFILL_PATTERN = "top_solid_infill_pattern"
+PRUSA_KEY_LAYER_HEIGHT = "layer_height"
+PRUSA_KEY_FIRST_LAYER_HEIGHT = "first_layer_height"
+PRUSA_LAYER_COUNT_KEYS = ("total_layer_count", "num_layers")
+PRUSA_CUSTOM_PARAM_KEYS = (
+    "custom_parameters_print",
+    "custom_parameters_filament",
+    "custom_parameters_printer",
+)
 
-Z_APPROACH_MAX = 2.0
-Z_MIN_WARN = 0.35
-LAYER_RETRACT = True
-M204_CAP_LAYERS = 3
-SUPPORT_OVERHANG_MIN = 1
-
-ENABLE_MESH_ON_START = "M420 S1 Z10 ; postprocess mesh"
-
-INVALID_MACRO_SNIPPET = "first_layer_height[0]"
 THUMBNAIL_BEGIN = "; thumbnail begin"
 THUMBNAIL_END = "; thumbnail end"
+INVALID_MACRO_SNIPPET = "first_layer_height[0]"
+
+ENABLE_MESH_ON_START = "M420 S1 Z10 ; postprocess mesh"
+Z_MIN_WARN = 0.35
+Z_VALIDATION_LOW_MM = 0.5
+LAYER_RETRACT = True
+SUPPORT_OVERHANG_MIN = 1
 
 TYPE_TOP_SOLID = ";TYPE:Top solid infill"
 TYPE_IRONING = ";TYPE:Ironing"
@@ -74,241 +86,121 @@ BED_X_MAX = 218.0
 BED_Y_MIN = 2.0
 BED_Y_MAX = 218.0
 SKIRT_OFFSET_MM = 5.0
-Z_APPROACH_MIN = 0.5
-LOW_EST_TIME_SCAN_LIMIT = 100_000
-BBOX_SCAN_LIMIT = 100_000
+SKIRT_MIN_SIDE_MM = 0.1
+
 PEEK_SLICER_FAN_WINDOW = 24
 PEEK_RETRACT_WINDOW = 8
 OVERHANG_FAN_SKIP_THRESHOLD = 40
+LARGE_EXTRUDE_LINE_ESTIMATE_MULT = 50
 
 SMALL_PERIMETER_THRESHOLD_MM = 20.0
 SMALL_PERIMETER_SPEED_CAP_F = 900
 SMALL_PERIMETER_FLOW_BOOST_PCT = 105
 
+PA_FIRMWARE = "marlin"
+PA_K = 0.03
 PA_INFILL_SCALE = 1.2
 PA_PERIMETER_SCALE = 0.9
 PA_BRIDGE_SCALE = 0.5
 PA_IRONING_SCALE = 0.2
 
-KEY_IRONING = "ironing"
-KEY_TOP_SOLID_INFILL_PATTERN = "top_solid_infill_pattern"
-KEY_LAYER_HEIGHT = "layer_height"
-KEY_FIRST_LAYER_HEIGHT = "first_layer_height"
-KEY_FLOW_RAMP = "flow_ramp"
-KEY_NOZZLE_DIAMETER_MM = "nozzle_diameter_mm"
-KEY_NOZZLE_DIAMETER = "nozzle_diameter"
-KEY_RETRACT_LENGTH = "retract_length"
-KEY_RETRACT_SPEED = "retract_speed"
-KEY_RETRACT_LIFT = "retract_lift"
-KEY_DISABLE_FAN_FIRST_LAYERS = "disable_fan_first_layers"
-KEY_FULL_FAN_SPEED_LAYER = "full_fan_speed_layer"
-KEY_MIN_FAN_SPEED = "min_fan_speed"
-KEY_MAX_FAN_SPEED = "max_fan_speed"
-KEY_BRIDGE_FAN_SPEED = "bridge_fan_speed"
-KEY_BRIDGE_FLOW_RATIO = "bridge_flow_ratio"
-KEY_OVERHANG_FAN_PCT = "overhang_fan_pct"
-KEY_TOP_FAN_PCT = "top_fan_pct"
-KEY_IRONING_FAN_PCT = "ironing_fan_pct"
-KEY_INTERFACE_FAN_PCT = "interface_fan_pct"
-KEY_SUPPORT_FAN_PCT = "support_fan_pct"
-KEY_SEAM_EXTRA_RETRACT = "seam_extra_retract"
-KEY_SEAM_FLOW_PCT = "seam_flow_pct"
-KEY_SEAM_FAN_PWM = "seam_fan_pwm"
-KEY_SEAM_JOIN_SPEED = "seam_join_speed"
-KEY_FIRST_LAYER_SPEED = "first_layer_speed"
-KEY_MAX_PRINT_SPEED = "max_print_speed"
-KEY_FIRST_LAYER_ACCELERATION = "first_layer_acceleration"
-KEY_DEFAULT_ACCELERATION = "default_acceleration"
-KEY_PA_K = "pa_k"
-KEY_CAP_EXTRUSION_LAYERS = "cap_extrusion_layers"
-KEY_FIRST_LAYER_MOTION_LAYERS = "first_layer_motion_layers"
-KEY_SKIRTS = "skirts"
-KEY_MIN_SKIRT_LENGTH = "min_skirt_length"
-KEY_PP_SKIRT_ORIGIN_X = "pp_skirt_origin_x"
-KEY_PP_SKIRT_ORIGIN_Y = "pp_skirt_origin_y"
-KEY_PP_SKIRT_LOOP_OFFSET_MM = "pp_skirt_loop_offset_mm"
-KEY_PP_SKIRT_EXTRUSION_MM_PER_MM = "pp_skirt_extrusion_mm_per_mm"
-KEY_FIRST_LAYER_TEMPERATURE = "first_layer_temperature"
-KEY_MAX_VOLUMETRIC_FLOW = "max_volumetric_flow"
+FAN_PWM_MAX = 255
+FLOW_NORMAL_PCT = 100
+MM_S_TO_F = 60
+
+NOZZLE_DIAMETER_MM = 0.8
+FILAMENT_TYPE = "PLA"
+LAYER_HEIGHT_FIRST_MM = 0.24
+TEMP_FIRST_LAYER_C = "215"
+MAX_VOLUMETRIC_FLOW_MM3_S = 15.0
+
+RETRACT_LENGTH_MM = 1.2
+RETRACT_SPEED_MM_S = 45.0
+RETRACT_LIFT_MM = 0.4
+
+FAN_OFF_LAYERS = 2
+FAN_RAMP_LAYERS = 2
+FAN_FULL_LAYER = FAN_OFF_LAYERS + FAN_RAMP_LAYERS + 1
+FAN_MIN_PCT = 80
+FAN_MAX_PCT = 100
+FAN_BRIDGE_PCT = 100
+FAN_OVERHANG_PCT = 86
+FAN_TOP_PCT = 71
+FAN_IRONING_PCT = 35
+FAN_INTERFACE_PCT = 78
+FAN_SUPPORT_PCT = 78
+
+FLOW_RAMP = (100, 88, 92, 96)
+FLOW_BRIDGE_PCT = 95
+NOZZLE_WALL_MM_S = 30
+NOZZLE_INFILL_MM_S = 55
+NOZZLE_CAP_MM_S = 25
+NOZZLE_TRAVEL_MM_S = 40
+SPEED_FIRST_LAYER_MM_S = 20.0
+SPEED_MAX_PRINT_MM_S = 250.0
+
+ACCEL_FIRST_LAYER = 500
+ACCEL_DEFAULT = 2000
+LAYER_CAP_EXTRUSION = 3
+LAYER_FIRST_MOTION = 3
+
+SEAM_EXTRA_RETRACT_MM = 0.4
+SEAM_FLOW_PCT = 96
+SEAM_FAN_PCT = 85
+SEAM_JOIN_SPEED_MM_S = 18.0
+
+SKIRT_LOOPS = 3
+SKIRT_SIDE_MM = 40.0
+SKIRT_ORIGIN_X_MM = 3.0
+SKIRT_ORIGIN_Y_MM = 3.0
+SKIRT_LOOP_OFFSET_MM = 2.0
+SKIRT_EXTRUSION_MM_PER_MM = 0.1
+
+PURGE_X_START = 2.0
+PURGE_X_SECOND = 2.3
+PURGE_Y_START = 20.0
+PURGE_Y_END = 145.0
+PURGE_TRAVEL_F = 5000
+PURGE_Z_F = 1500
+PURGE_EXTRUDE_F = 1500
+PURGE_E_FACTOR = 125.0
+PURGE_NOZZLE_MULT = 1.25
+PURGE_E_DIVISOR = 2.405
+PURGE_E_SECOND_MULT = 2.0
+
+Z_HOP_F = 600
+SKIRT_Z_F = 600
+SKIRT_TRAVEL_F = 6000
+SKIRT_EXTRUDE_F = 600
+
 ENV_E5S1_EXPORT_DIR = "E5S1_EXPORT_DIR"
+EXPORT_FOLDER_NAMES = ("Downloads", "Documentos", "Documents")
+EXPORT_MAX_AGE_S = 300
+EXPORT_MAX_FILES = 5
 
-def _auto_cast(value: str) -> Any:
-    """Cast string to appropriate type (int/float/bool/str)."""
-    value = value.strip()
-    lower = value.lower()
-    if lower in ("true", "yes", "on"):
-        return True
-    if lower in ("false", "no", "off"):
-        return False
-    try:
-        return int(value)
-    except ValueError:
-        try:
-            return float(value)
-        except ValueError:
-            return value
-
-class BundleConfig:
-    def __init__(self, path: Path | str | None = None):
-        self._config = configparser.ConfigParser(allow_no_value=True)
-        self._config.optionxform = lambda option: str(option)  # Preserve case
-
-        if path:
-            self._config_path = Path(path).resolve()
-        else:
-            self._config_path = self._find_path()
-
-        if self._config_path and self._config_path.exists():
-            self.load()
-
-    @property
-    def sections(self) -> list[str]:
-        return self._config.sections()
-
-    def _find_path(self) -> Path | None:
-        """Find bundle.ini or .bundle.ini in common locations."""
-        search = [
-            Path.cwd(),
-            Path(__file__).resolve().parent.parent,
-            Path.home(),
-        ]
-        for d in search:
-            for name in ("bundle.ini", ".bundle.ini"):
-                p = d / name
-                if p.exists():
-                    return p
-        return None
-
-    def load(self) -> None:
-        if self._config_path:
-            self._config.read(self._config_path, encoding="utf-8")
-
-    def save(self, path: Path | str | None = None) -> None:
-        """Save to disk (create file if missing, default to project root)."""
-        p = Path(path).resolve() if path else self._config_path
-        if not p:
-            p = Path(__file__).resolve().parent.parent / "bundle.ini"
-
-        p.parent.mkdir(exist_ok=True, parents=True)
-        with open(p, "w", encoding="utf-8") as f:
-            self._config.write(f)
-        self._config_path = p
-
-    def get(
-        self,
-        key: str,
-        default: Any = None,
-        section_priority: list[str] | None = None,
-        converter: Any = None,
-    ) -> Any:
-        """Get config value, checking sections in priority order."""
-        sections = section_priority or [
-            *[s for s in self._config.sections() if s.startswith("print:")],
-            *[s for s in self._config.sections() if s.startswith("filament:")],
-            *[s for s in self._config.sections() if s.startswith("printer:")],
-            *[s for s in self._config.sections() if not s.startswith(("print:", "filament:", "printer:"))],
-            "defaults",
-        ]
-        for s in sections:
-            if self._config.has_option(s, key):
-                value = self._config.get(s, key)
-                return converter(value) if converter else _auto_cast(value)
-        return default
-
-    def has(
-        self,
-        key: str,
-        section: str | None = None,
-    ) -> bool:
-        """Check if key exists (optionally in a specific section)."""
-        if section:
-            return self._config.has_option(section, key)
-        return any(self._config.has_option(s, key) for s in self._config.sections())
-
-    def set(
-        self,
-        key: str,
-        value: Any,
-        section: str = "defaults",
-        auto_save: bool = True,
-    ) -> None:
-        """Set config value and save automatically (default to [defaults] section)."""
-        if not self._config.has_section(section):
-            self._config.add_section(section)
-        self._config.set(section, key, str(value))
-        if auto_save:
-            self.save()
-
-class BundleConfigFactory:
-    _instance: BundleConfig | None = None
-
-    @classmethod
-    def get_instance(cls) -> BundleConfig:
-        if cls._instance is None:
-            cls._instance = BundleConfig()
-        return cls._instance
-
-def get_bundle_config() -> BundleConfig:
-    return BundleConfigFactory.get_instance()
-
-CUSTOM_PARAM_KEYS = (
-    "custom_parameters_print",
-    "custom_parameters_filament",
-    "custom_parameters_printer",
-)
-
-DEFAULT_NOZZLE_DIAMETER_MM = 0.8
-DEFAULT_NOZZLE_WALL_MM_S = 30
-DEFAULT_NOZZLE_INFILL_MM_S = 55
-DEFAULT_NOZZLE_CAP_MM_S = 25
-DEFAULT_NOZZLE_DEFAULT_MM_S = 40
-
-DEFAULT_RETRACT_LENGTH_MM = 1.2
-DEFAULT_RETRACT_SPEED_MM_S = 45.0
-DEFAULT_RETRACT_LIFT_MM = 0.4
-
-DEFAULT_FAN_OFF_LAYERS = 2
-DEFAULT_FAN_RAMP_LAYERS = 2
-DEFAULT_MIN_FAN_PCT = 80
-DEFAULT_MAX_FAN_PCT = 100
-DEFAULT_BRIDGE_FAN_PCT = 100
-
-DEFAULT_BRIDGE_FLOW_PCT = 95
-DEFAULT_FIRST_LAYER_SPEED_MM_S = 20.0
-DEFAULT_MAX_PRINT_SPEED_MM_S = 250.0
-DEFAULT_FIRST_LAYER_ACCEL = 500
-DEFAULT_DEFAULT_ACCEL = 2000
-DEFAULT_FIRST_LAYER_HEIGHT_MM = 0.24
-DEFAULT_FIRST_LAYER_TEMPERATURE_C = "215"
-
-DEFAULT_CAP_EXTRUSION_LAYERS = 3
-DEFAULT_FIRST_LAYER_MOTION_LAYERS = 3
-DEFAULT_FLOW_RAMP = (100, 88, 92, 96)
-
-DEFAULT_SEAM_EXTRA_RETRACT_MM = 0.4
-DEFAULT_SEAM_FLOW_PCT = 96
-DEFAULT_SEAM_FAN_PCT = 85
-DEFAULT_SEAM_JOIN_SPEED_MM_S = 18.0
-
-DEFAULT_OVERHANG_FAN_PCT = 86
-DEFAULT_TOP_FAN_PCT = 71
-DEFAULT_IRONING_FAN_PCT = 35
-DEFAULT_INTERFACE_FAN_PCT = 78
-DEFAULT_SUPPORT_FAN_PCT = 78
-
-DEFAULT_PA_K = 0.03
-DEFAULT_BUNDLE_PA_K = 0.03
-DEFAULT_MAX_VOLUMETRIC_FLOW = 15.0
-
-DEFAULT_SKIRT_LOOPS = 3
-DEFAULT_SKIRT_SIDE_MM = 40.0
-DEFAULT_SKIRT_ORIGIN_X_MM = 3.0
-DEFAULT_SKIRT_ORIGIN_Y_MM = 3.0
-DEFAULT_SKIRT_LOOP_OFFSET_MM = 2.0
-DEFAULT_SKIRT_EXTRUSION_MM_PER_MM = 0.1
-
-class ProfileConfigError(ValueError):
-    pass
+F_RE = re.compile(r"F(\d+)", re.IGNORECASE)
+FAN_ON_RE = re.compile(r"^M106\s+S(\d+)", re.IGNORECASE)
+PP_FAN_RE = re.compile(r"^M106\s+S\d+\s*;.*postprocess", re.IGNORECASE | re.MULTILINE)
+G1_EXTRUDE_RE = re.compile(r"^G1\b.*\bE[-+]?\d", re.IGNORECASE | re.MULTILINE)
+RETRACT_RE = re.compile(r"^G1\b.*\bE-", re.IGNORECASE)
+MOTION_RE = re.compile(r"^[GM]\d", re.IGNORECASE)
+M104_RE = re.compile(r"^M104\s+S(\d+)", re.IGNORECASE)
+M109_RE = re.compile(r"^M109\b", re.IGNORECASE | re.MULTILINE)
+M140_RE = re.compile(r"^M140\b", re.IGNORECASE)
+M190_RE = re.compile(r"^M190\b", re.IGNORECASE)
+M204_S_RE = re.compile(r"^M204\s+S(\d+)", re.IGNORECASE)
+M420_RE = re.compile(r"^M420\b", re.IGNORECASE)
+M900_RE = re.compile(r"^M900\b", re.IGNORECASE | re.MULTILINE)
+G28_RE = re.compile(r"^G28\b", re.MULTILINE)
+G29_RE = re.compile(r"^G29\b", re.IGNORECASE)
+Z_MOVE_RE = re.compile(r"^G0?1\b.*\bZ([\d.]+)", re.MULTILINE | re.I)
+LAYER_H_RE = re.compile(r";\s*layer_height\s*[=:]\s*([\d.,]+)", re.IGNORECASE)
+LAYER_H_PATH_RE = re.compile(r"_(\d+[,.]\d+)mm_", re.IGNORECASE)
+SLICER_TIME_RE = re.compile(r"; estimated printing time[^=\n]*=\s*(.+)", re.IGNORECASE)
+BED_MESH_RE = re.compile(r"BED_MESH", re.I)
+X_VAL_RE = re.compile(r"\b[Xx]([\d.-]+)")
+Y_VAL_RE = re.compile(r"\b[Yy]([\d.-]+)")
+E_VAL_RE = re.compile(r"\b[Ee]([\d.-]+)")
 
 class E5S1Profile(TypedDict):
     retract_mm: float
@@ -354,10 +246,10 @@ class E5S1Profile(TypedDict):
     max_volumetric_flow: float
 
 def pct_to_pwm(pct: int) -> int:
-    return max(0, min(255, int(255 * pct / 100)))
+    return max(0, min(FAN_PWM_MAX, int(FAN_PWM_MAX * pct / 100)))
 
-def resolve_pa_firmware(gcode_sample: str = "") -> str:
-    return "marlin"
+def resolve_pa_firmware() -> str:
+    return PA_FIRMWARE
 
 def _parse_custom_parameters(raw: str) -> dict[str, str]:
     out: dict[str, str] = {}
@@ -372,7 +264,7 @@ def _parse_custom_parameters(raw: str) -> dict[str, str]:
 
 def _merge_custom_parameters(cfg: dict[str, str]) -> dict[str, str]:
     merged = dict(cfg)
-    for key in CUSTOM_PARAM_KEYS:
+    for key in PRUSA_CUSTOM_PARAM_KEYS:
         merged.update(_parse_custom_parameters(cfg.get(key, "")))
     return merged
 
@@ -397,217 +289,51 @@ def parse_prusa_config(text: str) -> dict[str, str]:
         out[key.strip()] = val.strip()
     return _merge_custom_parameters(out)
 
-def _init_bundle_defaults(bundle: BundleConfig, prusa_cfg: dict[str, str]) -> None:
-    # First, sync known keys from prusa_cfg if not already set in bundle
-    for key, val in prusa_cfg.items():
-        if not bundle.has(key):
-            bundle.set(key, val)
-
-    # Now set our E5S1 defaults if not set
-    defaults: dict[str, Any] = {
-        KEY_NOZZLE_DIAMETER: DEFAULT_NOZZLE_DIAMETER_MM,
-        KEY_RETRACT_LENGTH: DEFAULT_RETRACT_LENGTH_MM,
-        KEY_RETRACT_SPEED: DEFAULT_RETRACT_SPEED_MM_S,
-        KEY_RETRACT_LIFT: DEFAULT_RETRACT_LIFT_MM,
-        KEY_DISABLE_FAN_FIRST_LAYERS: DEFAULT_FAN_OFF_LAYERS,
-        KEY_FULL_FAN_SPEED_LAYER: DEFAULT_FAN_OFF_LAYERS + DEFAULT_FAN_RAMP_LAYERS + 1,
-        KEY_MIN_FAN_SPEED: DEFAULT_MIN_FAN_PCT,
-        KEY_MAX_FAN_SPEED: DEFAULT_MAX_FAN_PCT,
-        KEY_BRIDGE_FAN_SPEED: DEFAULT_BRIDGE_FAN_PCT,
-        KEY_BRIDGE_FLOW_RATIO: DEFAULT_BRIDGE_FLOW_PCT / 100,
-        KEY_OVERHANG_FAN_PCT: DEFAULT_OVERHANG_FAN_PCT,
-        KEY_TOP_FAN_PCT: DEFAULT_TOP_FAN_PCT,
-        KEY_IRONING_FAN_PCT: DEFAULT_IRONING_FAN_PCT,
-        KEY_INTERFACE_FAN_PCT: DEFAULT_INTERFACE_FAN_PCT,
-        KEY_SUPPORT_FAN_PCT: DEFAULT_SUPPORT_FAN_PCT,
-        KEY_SEAM_EXTRA_RETRACT: DEFAULT_SEAM_EXTRA_RETRACT_MM,
-        KEY_SEAM_FLOW_PCT: DEFAULT_SEAM_FLOW_PCT,
-        KEY_SEAM_FAN_PWM: DEFAULT_SEAM_FAN_PCT,
-        KEY_SEAM_JOIN_SPEED: DEFAULT_SEAM_JOIN_SPEED_MM_S,
-        KEY_FIRST_LAYER_SPEED: DEFAULT_FIRST_LAYER_SPEED_MM_S,
-        KEY_MAX_PRINT_SPEED: DEFAULT_MAX_PRINT_SPEED_MM_S,
-        KEY_FIRST_LAYER_ACCELERATION: DEFAULT_FIRST_LAYER_ACCEL,
-        KEY_DEFAULT_ACCELERATION: DEFAULT_DEFAULT_ACCEL,
-        KEY_PA_K: DEFAULT_PA_K,
-        KEY_FLOW_RAMP: ",".join(map(str, DEFAULT_FLOW_RAMP)),
-        KEY_CAP_EXTRUSION_LAYERS: DEFAULT_CAP_EXTRUSION_LAYERS,
-        KEY_FIRST_LAYER_MOTION_LAYERS: DEFAULT_FIRST_LAYER_MOTION_LAYERS,
-        KEY_SKIRTS: DEFAULT_SKIRT_LOOPS,
-        KEY_MIN_SKIRT_LENGTH: DEFAULT_SKIRT_SIDE_MM,
-        KEY_PP_SKIRT_ORIGIN_X: DEFAULT_SKIRT_ORIGIN_X_MM,
-        KEY_PP_SKIRT_ORIGIN_Y: DEFAULT_SKIRT_ORIGIN_Y_MM,
-        KEY_PP_SKIRT_LOOP_OFFSET_MM: DEFAULT_SKIRT_LOOP_OFFSET_MM,
-        KEY_PP_SKIRT_EXTRUSION_MM_PER_MM: DEFAULT_SKIRT_EXTRUSION_MM_PER_MM,
-        KEY_FIRST_LAYER_HEIGHT: DEFAULT_FIRST_LAYER_HEIGHT_MM,
-        KEY_FIRST_LAYER_TEMPERATURE: int(DEFAULT_FIRST_LAYER_TEMPERATURE_C),
-        KEY_MAX_VOLUMETRIC_FLOW: DEFAULT_MAX_VOLUMETRIC_FLOW,
-    }
-
-    for key, val in defaults.items():
-        if val is not None and not bundle.has(key):
-            bundle.set(key, val)
-
-def build_e5s1_profile(prusa_cfg: dict[str, str] | None = None, bundle: BundleConfig | None = None) -> E5S1Profile:
-    prusa_cfg = _merge_custom_parameters(prusa_cfg or {})
-    if bundle is None:
-        bundle = get_bundle_config()
-
-    # Initialize bundle with defaults (if not already present)
-    _init_bundle_defaults(bundle, prusa_cfg)
-
-    # Helper functions for common conversions prioritizing prusa_cfg
-    def get_str(key: str, default: str) -> str:
-        val = prusa_cfg.get(key)
-        if val is not None and val.lower() != "nil":
-            return val
-        return str(bundle.get(key, default))
-
-    def get_int(key: str, default: int) -> int:
-        val = prusa_cfg.get(key)
-        if val is not None and val.lower() != "nil":
-            try:
-                return int(float(val.replace(",", ".")))
-            except ValueError:
-                pass
-        return bundle.get(key, default, converter=int)
-
-    def get_float(key: str, default: float) -> float:
-        val = prusa_cfg.get(key)
-        if val is not None and val.lower() != "nil":
-            try:
-                return float(val.replace(",", ".").rstrip("%"))
-            except ValueError:
-                pass
-        return bundle.get(key, default, converter=float)
-
-    def get_pwm(key: str, default_pct: int) -> int:
-        return pct_to_pwm(get_int(key, default_pct))
-
-    def get_speed_f(key: str, default_mm_s: float) -> int:
-        return int(get_float(key, default_mm_s) * 60)
-
-    def get_optional_speed_f(key: str) -> int | None:
-        val = get_str(key, "")
-        if not val or val.lower() == "nil":
-            return None
-        try:
-            speed_mm_s = float(val.replace(",", "."))
-            if speed_mm_s <= 0:
-                return None
-            return int(speed_mm_s * 60)
-        except ValueError:
-            return None
-
-    def parse_flow_ramp(raw_val: str, default: tuple[int, ...]) -> list[int]:
-        if not raw_val:
-            return list(default)
-        try:
-            return [int(x.strip()) for x in raw_val.split(",") if x.strip()]
-        except ValueError as exc:
-            raise ProfileConfigError("Invalid flow_ramp value") from exc
-
-    # Locked to PLA and 0.8mm nozzle
-    filament_type = "PLA"
-    nozzle_diameter = 0.8
-
-    max_print_speed_val = get_float("max_print_speed", DEFAULT_MAX_PRINT_SPEED_MM_S)
-    retract_speed_val = get_float(KEY_RETRACT_SPEED, DEFAULT_RETRACT_SPEED_MM_S)
-
-    fan_off = get_int(KEY_DISABLE_FAN_FIRST_LAYERS, DEFAULT_FAN_OFF_LAYERS)
-    full_fan = get_int(KEY_FULL_FAN_SPEED_LAYER, fan_off + DEFAULT_FAN_RAMP_LAYERS + 1)
-    bridge_ratio = get_float(KEY_BRIDGE_FLOW_RATIO, DEFAULT_BRIDGE_FLOW_PCT / 100)
-    bridge_flow_pct = int(bridge_ratio * 100) if bridge_ratio <= 1 else int(bridge_ratio)
-
-    wall_early_f = get_optional_speed_f("pp_wall_speed_mm_s")
-    if wall_early_f is None:
-        wall_early_f = int(nozzle_diameter * DEFAULT_NOZZLE_WALL_MM_S * 60)
-    max_infill_f = get_optional_speed_f("pp_infill_speed_mm_s")
-    if max_infill_f is None:
-        max_infill_f = int(nozzle_diameter * DEFAULT_NOZZLE_INFILL_MM_S * 60)
-    cap_extrusion_f = get_optional_speed_f("pp_cap_speed_mm_s")
-    if cap_extrusion_f is None:
-        cap_extrusion_f = int(nozzle_diameter * DEFAULT_NOZZLE_CAP_MM_S * 60)
-    default_motion_f = int(nozzle_diameter * DEFAULT_NOZZLE_DEFAULT_MM_S * 60)
-
-    # Simplified PA K-value loader
-    user_pa = get_str(KEY_PA_K, "")
-    if user_pa and user_pa != str(DEFAULT_PA_K) and user_pa != str(DEFAULT_BUNDLE_PA_K):
-        try:
-            pa_k = float(user_pa)
-        except ValueError:
-            pa_k = get_float(KEY_PA_K, DEFAULT_PA_K)
-    else:
-        pa_k = DEFAULT_PA_K
-
-    # Simple flow ramp configuration
-    if KEY_FLOW_RAMP in prusa_cfg:
-        flow_ramp = parse_flow_ramp(prusa_cfg[KEY_FLOW_RAMP], DEFAULT_FLOW_RAMP)
-    else:
-        flow_ramp = parse_flow_ramp(bundle.get(KEY_FLOW_RAMP, ",".join(map(str, DEFAULT_FLOW_RAMP))), DEFAULT_FLOW_RAMP)
-
+def build_e5s1_profile() -> E5S1Profile:
+    """Perfil E5S1 calibrado — sempre hardcoded; ignora bundle e config do slicer."""
     return {
-        "retract_mm": get_float(KEY_RETRACT_LENGTH, DEFAULT_RETRACT_LENGTH_MM),
-        "retract_f": int(retract_speed_val * 60),
-        "retract_lift": get_float(KEY_RETRACT_LIFT, DEFAULT_RETRACT_LIFT_MM),
-        "fan_off_layers": fan_off,
-        "full_fan_layer": full_fan,
-        "min_fan_pwm": get_pwm(KEY_MIN_FAN_SPEED, DEFAULT_MIN_FAN_PCT),
-        "max_fan_pwm": get_pwm(KEY_MAX_FAN_SPEED, DEFAULT_MAX_FAN_PCT),
-        "bridge_fan_pwm": get_pwm(KEY_BRIDGE_FAN_SPEED, DEFAULT_BRIDGE_FAN_PCT),
-        "bridge_flow_pct": bridge_flow_pct,
-        "overhang_fan_pwm": get_pwm(KEY_OVERHANG_FAN_PCT, DEFAULT_OVERHANG_FAN_PCT),
-        "top_fan_pwm": get_pwm(KEY_TOP_FAN_PCT, DEFAULT_TOP_FAN_PCT),
-        "ironing_fan_pwm": get_pwm(KEY_IRONING_FAN_PCT, DEFAULT_IRONING_FAN_PCT),
-        "interface_fan_pwm": get_pwm(KEY_INTERFACE_FAN_PCT, DEFAULT_INTERFACE_FAN_PCT),
-        "support_fan_pwm": get_pwm(KEY_SUPPORT_FAN_PCT, DEFAULT_SUPPORT_FAN_PCT),
-        "seam_extra_retract": get_float(KEY_SEAM_EXTRA_RETRACT, DEFAULT_SEAM_EXTRA_RETRACT_MM),
-        "seam_flow_pct": get_int(KEY_SEAM_FLOW_PCT, DEFAULT_SEAM_FLOW_PCT),
-        "seam_fan_pwm": get_pwm(KEY_SEAM_FAN_PWM, DEFAULT_SEAM_FAN_PCT),
-        "seam_join_f": get_speed_f(KEY_SEAM_JOIN_SPEED, DEFAULT_SEAM_JOIN_SPEED_MM_S),
-        "first_layer_f": get_speed_f(KEY_FIRST_LAYER_SPEED, DEFAULT_FIRST_LAYER_SPEED_MM_S),
-        "wall_early_f": wall_early_f,
-        "max_infill_f": max_infill_f,
-        "cap_extrusion_f": cap_extrusion_f,
-        "max_print_f": int(max_print_speed_val * 60),
-        "default_motion_f": default_motion_f,
-        "first_layer_accel": get_int(KEY_FIRST_LAYER_ACCELERATION, DEFAULT_FIRST_LAYER_ACCEL),
-        "default_accel": get_int(KEY_DEFAULT_ACCELERATION, DEFAULT_DEFAULT_ACCEL),
-        "pa_k": pa_k,
-        "flow_ramp": flow_ramp,
-        "cap_extrusion_layers": get_int(KEY_CAP_EXTRUSION_LAYERS, DEFAULT_CAP_EXTRUSION_LAYERS),
-        "first_layer_motion_layers": get_int(KEY_FIRST_LAYER_MOTION_LAYERS, DEFAULT_FIRST_LAYER_MOTION_LAYERS),
-        "skirt_loops": get_int(KEY_SKIRTS, DEFAULT_SKIRT_LOOPS),
-        "skirt_side_mm": get_float(KEY_MIN_SKIRT_LENGTH, DEFAULT_SKIRT_SIDE_MM),
-        "skirt_origin_x_mm": get_float(KEY_PP_SKIRT_ORIGIN_X, DEFAULT_SKIRT_ORIGIN_X_MM),
-        "skirt_origin_y_mm": get_float(KEY_PP_SKIRT_ORIGIN_Y, DEFAULT_SKIRT_ORIGIN_Y_MM),
-        "skirt_loop_offset_mm": get_float(KEY_PP_SKIRT_LOOP_OFFSET_MM, DEFAULT_SKIRT_LOOP_OFFSET_MM),
-        "skirt_extrusion_mm_per_mm": get_float(KEY_PP_SKIRT_EXTRUSION_MM_PER_MM, DEFAULT_SKIRT_EXTRUSION_MM_PER_MM),
-        "first_layer_height_mm": get_float(KEY_FIRST_LAYER_HEIGHT, DEFAULT_FIRST_LAYER_HEIGHT_MM),
-        "first_layer_temperature_c": str(get_int(KEY_FIRST_LAYER_TEMPERATURE, int(DEFAULT_FIRST_LAYER_TEMPERATURE_C))),
-        "nozzle_diameter_mm": nozzle_diameter,
-        "filament_type": filament_type,
-        "max_volumetric_flow": get_float(KEY_MAX_VOLUMETRIC_FLOW, DEFAULT_MAX_VOLUMETRIC_FLOW),
+        "retract_mm": RETRACT_LENGTH_MM,
+        "retract_f": int(RETRACT_SPEED_MM_S * MM_S_TO_F),
+        "retract_lift": RETRACT_LIFT_MM,
+        "fan_off_layers": FAN_OFF_LAYERS,
+        "full_fan_layer": FAN_FULL_LAYER,
+        "min_fan_pwm": pct_to_pwm(FAN_MIN_PCT),
+        "max_fan_pwm": pct_to_pwm(FAN_MAX_PCT),
+        "bridge_fan_pwm": pct_to_pwm(FAN_BRIDGE_PCT),
+        "bridge_flow_pct": FLOW_BRIDGE_PCT,
+        "overhang_fan_pwm": pct_to_pwm(FAN_OVERHANG_PCT),
+        "top_fan_pwm": pct_to_pwm(FAN_TOP_PCT),
+        "ironing_fan_pwm": pct_to_pwm(FAN_IRONING_PCT),
+        "interface_fan_pwm": pct_to_pwm(FAN_INTERFACE_PCT),
+        "support_fan_pwm": pct_to_pwm(FAN_SUPPORT_PCT),
+        "seam_extra_retract": SEAM_EXTRA_RETRACT_MM,
+        "seam_flow_pct": SEAM_FLOW_PCT,
+        "seam_fan_pwm": pct_to_pwm(SEAM_FAN_PCT),
+        "seam_join_f": int(SEAM_JOIN_SPEED_MM_S * MM_S_TO_F),
+        "first_layer_f": int(SPEED_FIRST_LAYER_MM_S * MM_S_TO_F),
+        "wall_early_f": int(NOZZLE_DIAMETER_MM * NOZZLE_WALL_MM_S * MM_S_TO_F),
+        "max_infill_f": int(NOZZLE_DIAMETER_MM * NOZZLE_INFILL_MM_S * MM_S_TO_F),
+        "cap_extrusion_f": int(NOZZLE_DIAMETER_MM * NOZZLE_CAP_MM_S * MM_S_TO_F),
+        "max_print_f": int(SPEED_MAX_PRINT_MM_S * MM_S_TO_F),
+        "default_motion_f": int(NOZZLE_DIAMETER_MM * NOZZLE_TRAVEL_MM_S * MM_S_TO_F),
+        "first_layer_accel": ACCEL_FIRST_LAYER,
+        "default_accel": ACCEL_DEFAULT,
+        "pa_k": PA_K,
+        "flow_ramp": list(FLOW_RAMP),
+        "cap_extrusion_layers": LAYER_CAP_EXTRUSION,
+        "first_layer_motion_layers": LAYER_FIRST_MOTION,
+        "skirt_loops": SKIRT_LOOPS,
+        "skirt_side_mm": SKIRT_SIDE_MM,
+        "skirt_origin_x_mm": SKIRT_ORIGIN_X_MM,
+        "skirt_origin_y_mm": SKIRT_ORIGIN_Y_MM,
+        "skirt_loop_offset_mm": SKIRT_LOOP_OFFSET_MM,
+        "skirt_extrusion_mm_per_mm": SKIRT_EXTRUSION_MM_PER_MM,
+        "first_layer_height_mm": LAYER_HEIGHT_FIRST_MM,
+        "first_layer_temperature_c": TEMP_FIRST_LAYER_C,
+        "nozzle_diameter_mm": NOZZLE_DIAMETER_MM,
+        "filament_type": FILAMENT_TYPE,
+        "max_volumetric_flow": MAX_VOLUMETRIC_FLOW_MM3_S,
     }
-
-F_RE = re.compile(r"F(\d+)", re.IGNORECASE)
-FAN_ON_RE = re.compile(r"^M106\s+S(\d+)", re.IGNORECASE)
-PP_FAN_RE = re.compile(r"^M106\s+S\d+\s*;.*postprocess", re.IGNORECASE | re.MULTILINE)
-G1_EXTRUDE_RE = re.compile(r"^G1\b.*\bE[-+]?\d", re.IGNORECASE | re.MULTILINE)
-RETRACT_RE = re.compile(r"^G1\b.*\bE-", re.IGNORECASE)
-MOTION_RE = re.compile(r"^[GM]\d", re.IGNORECASE)
-M104_RE = re.compile(r"^M104\s+S(\d+)", re.IGNORECASE)
-M109_RE = re.compile(r"^M109\b", re.IGNORECASE | re.MULTILINE)
-M140_RE = re.compile(r"^M140\b", re.IGNORECASE)
-M190_RE = re.compile(r"^M190\b", re.IGNORECASE)
-M204_S_RE = re.compile(r"^M204\s+S(\d+)", re.IGNORECASE)
-M420_RE = re.compile(r"^M420\b", re.IGNORECASE)
-M900_RE = re.compile(r"^M900\b", re.IGNORECASE | re.MULTILINE)
-G28_RE = re.compile(r"^G28\b", re.MULTILINE)
-G29_RE = re.compile(r"^G29\b", re.IGNORECASE)
-Z_MOVE_RE = re.compile(r"^G0?1\b.*\bZ([\d.]+)", re.MULTILINE | re.I)
-LAYER_H_RE = re.compile(r";\s*layer_height\s*[=:]\s*([\d.,]+)", re.IGNORECASE)
-LAYER_H_PATH_RE = re.compile(r"_(\d+[,.]\d+)mm_", re.IGNORECASE)
-SLICER_TIME_RE = re.compile(r"; estimated printing time[^=\n]*=\s*(.+)", re.IGNORECASE)
 
 def count_layers(text: str, prusa_cfg: dict[str, str] | None = None) -> int:
     before = text.count(LAYER_BEFORE_MARKER)
@@ -625,13 +351,13 @@ def count_layers(text: str, prusa_cfg: dict[str, str] | None = None) -> int:
         return lc
     if prusa_cfg is None:
         prusa_cfg = parse_prusa_config(text)
-    for key in ("total_layer_count", "num_layers"):
+    for key in PRUSA_LAYER_COUNT_KEYS:
         if key in prusa_cfg and prusa_cfg[key].isdigit():
             return int(prusa_cfg[key])
     return 0
 
 def has_skirt_or_brim(text: str) -> tuple[bool, bool]:
-    low = text[:120000].lower()
+    low = text[:SKIRT_BRIM_SCAN_CHARS].lower()
     has_skirt = any(
         tag in low
         for tag in (TYPE_SKIRT.lower(), TYPE_SKIRT_BRIM.lower(), "; skirt", "; type:skirt")
@@ -696,8 +422,6 @@ class GCodeFeatureScanner:
 def preserves_geometry(kind: str | None) -> bool:
     return kind in PRESERVE_GEOMETRY_FEATURES
 
-PP_SKIRT = "postprocess skirt"
-
 class MarlinGCodeEmitter:
     def mesh_enable(self) -> str:
         return ENABLE_MESH_ON_START
@@ -706,7 +430,7 @@ class MarlinGCodeEmitter:
         return f"M900 K{pa_k} ; linear advance postprocess"
 
 class GCodeBuilder:
-    def __init__(self, pa_fw: str = "marlin"):
+    def __init__(self, pa_fw: str = PA_FIRMWARE):
         self.emitter = MarlinGCodeEmitter()
         self.pa_fw = pa_fw
 
@@ -717,13 +441,19 @@ class GCodeBuilder:
         return f"M221 S{flow} ; postprocess flow L{layer}"
 
     def flow_reset(self) -> str:
-        return "M221 S100 ; postprocess flow normal"
+        return f"M221 S{FLOW_NORMAL_PCT} ; postprocess flow normal"
 
     def flow_bridge(self, pct: int) -> str:
         return f"M221 S{pct} ; postprocess flow bridge"
 
+    def flow_seam(self, pct: int) -> str:
+        return f"M221 S{pct} ; postprocess flow seam"
+
+    def seam_extra_retract(self, mm: float, retract_f: int) -> str:
+        return f"G1 E-{mm} F{retract_f} ; postprocess seam extra retract"
+
     def z_hop(self, mm: float) -> str:
-        return f"G91\nG1 Z{mm} F600 ; postprocess z hop\nG90"
+        return f"G91\nG1 Z{mm} F{Z_HOP_F} ; postprocess z hop\nG90"
 
     def layer_retract(self, mm: float, retract_f: int) -> str:
         return f"G1 E-{mm} F{retract_f} ; postprocess layer retract"
@@ -737,14 +467,14 @@ class GCodeBuilder:
     def mesh_enable(self) -> str:
         return self.emitter.mesh_enable()
 
-    def purge(self, nozzle_diameter: float = 0.8, first_layer_height: float = 0.24) -> str:
-        e_first = 125.0 * first_layer_height * (nozzle_diameter * 1.25) / 2.405
-        e_second = e_first * 2.0
-        return f"""G1 X2.0 Y20 F5000.0 ; postprocess purge
-G1 Z{first_layer_height:.3f} F1500.0 ; postprocess purge
-G1 X2.0 Y145.0 Z{first_layer_height:.3f} F1500.0 E{e_first:.2f} ; postprocess purge
-G1 X2.3 Y145.0 Z{first_layer_height:.3f} F5000.0 ; postprocess purge
-G1 X2.3 Y20 Z{first_layer_height:.3f} F1500.0 E{e_second:.2f} ; postprocess purge
+    def purge(self, nozzle_diameter: float = NOZZLE_DIAMETER_MM, first_layer_height: float = LAYER_HEIGHT_FIRST_MM) -> str:
+        e_first = PURGE_E_FACTOR * first_layer_height * (nozzle_diameter * PURGE_NOZZLE_MULT) / PURGE_E_DIVISOR
+        e_second = e_first * PURGE_E_SECOND_MULT
+        return f"""G1 X{PURGE_X_START} Y{PURGE_Y_START} F{PURGE_TRAVEL_F} ; postprocess purge
+G1 Z{first_layer_height:.3f} F{PURGE_Z_F} ; postprocess purge
+G1 X{PURGE_X_START} Y{PURGE_Y_END} Z{first_layer_height:.3f} F{PURGE_EXTRUDE_F} E{e_first:.2f} ; postprocess purge
+G1 X{PURGE_X_SECOND} Y{PURGE_Y_END} Z{first_layer_height:.3f} F{PURGE_TRAVEL_F} ; postprocess purge
+G1 X{PURGE_X_SECOND} Y{PURGE_Y_START} Z{first_layer_height:.3f} F{PURGE_EXTRUDE_F} E{e_second:.2f} ; postprocess purge
 G92 E0 ; postprocess purge"""
 
     def z_fix_suffix(self) -> str:
@@ -760,12 +490,12 @@ G92 E0 ; postprocess purge"""
         return f"; {PP_SKIRT}"
 
     def skirt_z(self, z: float) -> str:
-        return f"G1 Z{z} F600 ; {PP_SKIRT}"
+        return f"G1 Z{z} F{SKIRT_Z_F} ; {PP_SKIRT}"
 
-    def skirt_travel(self, x: float, y: float, f: int = 6000) -> str:
+    def skirt_travel(self, x: float, y: float, f: int = SKIRT_TRAVEL_F) -> str:
         return f"G1 X{x} Y{y} F{f} ; {PP_SKIRT}"
 
-    def skirt_extrude(self, x: float, y: float, e: float, f: int = 600) -> str:
+    def skirt_extrude(self, x: float, y: float, e: float, f: int = SKIRT_EXTRUDE_F) -> str:
         return f"G1 X{x} Y{y} E{e:.2f} F{f} ; {PP_SKIRT}"
 
     def skirt_reset_e(self) -> str:
@@ -843,7 +573,7 @@ class GCodeAnalyzer:
         end = min(len(text), METADATA_SCAN_BYTES)
         comment_lines = 0
 
-        while pos < end and comment_lines < 100_000:
+        while pos < end and comment_lines < METADATA_MAX_COMMENT_LINES:
             nl = text.find("\n", pos)
             if nl == -1 or nl > end:
                 line = text[pos:end]
@@ -922,16 +652,16 @@ class GCodeAnalyzer:
         top_lines = self.count_type_markers(text, TYPE_TOP_SOLID)
         ironing_lines = self.count_type_markers(text, TYPE_IRONING)
         interface_lines = self.count_type_markers(text, TYPE_INTERFACE)
-        cfg_ironing = prusa_cfg.get(KEY_IRONING, "0") not in ("0", "false", "")
+        cfg_ironing = prusa_cfg.get(PRUSA_KEY_IRONING, "0") not in ("0", "false", "")
         has_ironing = ironing_lines > 0 or cfg_ironing
-        top_pattern = prusa_cfg.get(KEY_TOP_SOLID_INFILL_PATTERN) or None
+        top_pattern = prusa_cfg.get(PRUSA_KEY_TOP_SOLID_INFILL_PATTERN) or None
         if large:
-            extrude_lines = max(text.count("\nG1"), top_lines * 50, 1)
+            extrude_lines = max(text.count("\nG1"), top_lines * LARGE_EXTRUDE_LINE_ESTIMATE_MULT, 1)
         else:
             extrude_lines = sum(1 for ln in text.splitlines() if G1_EXTRUDE_RE.match(ln.strip()))
         est_raw, layer_h = self._slicer_metadata(text)
         if layer_h is None:
-            lh = prusa_cfg.get(KEY_LAYER_HEIGHT) or prusa_cfg.get(KEY_FIRST_LAYER_HEIGHT)
+            lh = prusa_cfg.get(PRUSA_KEY_LAYER_HEIGHT) or prusa_cfg.get(PRUSA_KEY_FIRST_LAYER_HEIGHT)
             if lh:
                 try:
                     layer_h = float(lh.replace(",", "."))
@@ -1021,8 +751,8 @@ class GCodeValidator:
             warnings.append("No G28 (homing) in file")
 
         if not large:
-            z_low = [float(m.group(1)) for m in Z_MOVE_RE.finditer(startup) if float(m.group(1)) < 0.5]
-            if z_low and min(z_low) > Z_MIN_WARN:
+            z_low = [float(m.group(1)) for m in Z_MOVE_RE.finditer(startup) if float(m.group(1)) < Z_VALIDATION_LOW_MM]
+            if z_low and min(z_low) < Z_MIN_WARN:
                 warnings.append(f"Minimum Z {min(z_low):.2f}mm — check Z-offset")
 
         if not analysis["layers"]:
@@ -1036,11 +766,6 @@ class GCodeValidator:
             warnings.append("No skirt/brim — E5S1 skirt will be injected on post-process")
 
         return errors, warnings
-
-BED_MESH_RE = re.compile(r"BED_MESH", re.I)
-X_VAL_RE = re.compile(r"\b[Xx]([\d.-]+)")
-Y_VAL_RE = re.compile(r"\b[Yy]([\d.-]+)")
-E_VAL_RE = re.compile(r"\b[Ee]([\d.-]+)")
 
 def cap_f_line(line: str, cap: int, last_f: int, builder: GCodeBuilder) -> tuple[str, bool, int]:
     m = F_RE.search(line)
@@ -1066,17 +791,26 @@ def speed_cap_for(
         return min(profile["first_layer_f"], ceiling)
     if layer_count <= profile["cap_extrusion_layers"]:
         if kind in ("external", "perimeter", "gap_fill", "brim"):
-            return min(profile["wall_early_f"], ceiling)
-        return min(profile["cap_extrusion_f"], ceiling)
-    if kind in ("internal", "solid", "support"):
-        return min(profile["max_infill_f"], ceiling)
-    return None
+            cap = min(profile["wall_early_f"], ceiling)
+        else:
+            cap = min(profile["cap_extrusion_f"], ceiling)
+    elif kind in ("internal", "solid", "support"):
+        cap = min(profile["max_infill_f"], ceiling)
+    else:
+        cap = None
+    if kind in ("external", "perimeter", "gap_fill") and cap is not None:
+        cap = min(cap, profile["seam_join_f"])
+    elif kind in ("external", "perimeter", "gap_fill"):
+        cap = profile["seam_join_f"]
+    return cap
 
-def layer_retract_lines(profile: E5S1Profile, builder: GCodeBuilder) -> list[str]:
+def layer_retract_lines(profile: E5S1Profile, builder: GCodeBuilder, *, seam_extra: bool = False) -> list[str]:
     lines: list[str] = []
     if profile["retract_lift"] > 0:
         lines.append(builder.z_hop(profile["retract_lift"]))
     lines.append(builder.layer_retract(profile["retract_mm"], profile["retract_f"]))
+    if seam_extra and profile["seam_extra_retract"] > 0:
+        lines.append(builder.seam_extra_retract(profile["seam_extra_retract"], profile["retract_f"]))
     return lines
 
 def recent_retract(out: list[str], window: int = PEEK_RETRACT_WINDOW, *, seam: bool = False) -> bool:
@@ -1145,7 +879,7 @@ def fan_pwm_for_layer(layer: int, profile: E5S1Profile) -> int | None:
         step = layer - off
         pwm = max(1, int(profile["min_fan_pwm"] * step / span))
         return min(pwm, profile["max_fan_pwm"])
-    return None
+    return profile["max_fan_pwm"]
 
 def sanitize_startup_line(line: str, first_layer_height_mm: float) -> tuple[str | None, str | None]:
     stripped = line.rstrip("\n\r")
@@ -1168,7 +902,7 @@ def scan_bounding_box(lines: list[str]) -> tuple[float, float, float, float] | N
     max_x = max_y = float("-inf")
     has_moves = False
 
-    for line in lines:
+    for line in lines[:BBOX_SCAN_LIMIT]:
         stripped = line.strip()
         if not stripped or stripped.startswith(";"):
             continue
@@ -1221,7 +955,7 @@ def generate_contour_skirt(profile: E5S1Profile, bbox: tuple[float, float, float
         len_x = x1 - x0
         len_y = y1 - y0
 
-        if len_x <= 0.1 or len_y <= 0.1:
+        if len_x <= SKIRT_MIN_SIDE_MM or len_y <= SKIRT_MIN_SIDE_MM:
             continue
 
         segment_e_x = len_x * profile["skirt_extrusion_mm_per_mm"]
@@ -1243,7 +977,7 @@ def _fix_z_line(line: str, target: float, builder: GCodeBuilder) -> tuple[str, b
     if not m:
         return line, False
     z = float(m.group(1))
-    if Z_MIN_WARN < z < Z_APPROACH_MAX:
+    if z < Z_MIN_WARN:
         return re.sub(r"(\bZ)([\d.]+)", rf"\g<1>{target}", line, count=1, flags=re.I) + builder.z_fix_suffix(), True
     return line, False
 
@@ -1297,7 +1031,7 @@ def _normalize_startup_order(head: list[str]) -> list[str]:
             buckets["bed_heat"].append(line)
         elif G28_RE.search(line.strip()):
             buckets["g28"].append(line)
-        elif M420_RE.match(line.strip()) or "postprocess mesh" in low or "bed_mesh" in low:
+        elif G29_RE.search(line.strip()) or M420_RE.match(line.strip()) or "postprocess mesh" in low or "bed_mesh" in low:
             buckets["mesh"].append(line)
         elif M109_RE.match(line.strip()) or M104_RE.match(line.strip()):
             buckets["heat"].append(line)
@@ -1357,7 +1091,7 @@ def repair_purge_line(lines: list[str], profile: E5S1Profile, builder: GCodeBuil
     head = list(lines[:h_idx])
     if not any(G1_EXTRUDE_RE.match(line.strip()) for line in head):
         m109_idx = _line_index(head, M109_RE)
-        nozzle_dia = profile.get("nozzle_diameter_mm", DEFAULT_NOZZLE_DIAMETER_MM)
+        nozzle_dia = profile.get("nozzle_diameter_mm", NOZZLE_DIAMETER_MM)
         first_lh = profile["first_layer_height_mm"]
         _insert_after(head, m109_idx, builder.purge(nozzle_dia, first_lh))
         actions.append("purge_added")
@@ -1397,6 +1131,8 @@ def repair_startup_order_normalization(lines: list[str], profile: E5S1Profile, b
     h_idx = head_index(lines)
     head = list(lines[:h_idx])
     normalized_head = _normalize_startup_order(head)
+    if normalized_head != head:
+        actions.append("startup_order")
     return normalized_head + lines[h_idx:]
 
 def repair_small_perimeters(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
@@ -1408,7 +1144,7 @@ def repair_small_perimeters(lines: list[str], profile: E5S1Profile, builder: GCo
 
     for i, line in enumerate(lines):
         upper = line.upper()
-        if "TYPE:EXTERNAL PERIMETER" in upper or "TYPE:PERIMETER" in upper:
+        if "TYPE:EXTERNAL PERIMETER" in upper or TYPE_EXTERNAL.upper() in upper or TYPE_PERIMETER.upper() in upper:
             in_perimeter = True
             curr_seg = []
             curr_dist = 0.0
@@ -1432,7 +1168,6 @@ def repair_small_perimeters(lines: list[str], profile: E5S1Profile, builder: GCo
                 if not curr_seg:
                     curr_dist = 0.0
                 elif last_x is not None and last_y is not None and x is not None and y is not None:
-                    import math
                     curr_dist += math.hypot(x - last_x, y - last_y)
                 curr_seg.append(i)
             elif curr_seg:
@@ -1452,7 +1187,7 @@ def repair_small_perimeters(lines: list[str], profile: E5S1Profile, builder: GCo
         start_idx = seg[0]
         end_idx = seg[-1]
 
-        out.insert(end_idx + 1, "M221 S100 ; postprocess small perimeter flow reset")
+        out.insert(end_idx + 1, f"M221 S{FLOW_NORMAL_PCT} ; postprocess small perimeter flow reset")
 
         line_start = out[start_idx]
         if F_RE.search(line_start):
@@ -1479,7 +1214,16 @@ def repair_layer_marker(lines: list[str], profile: E5S1Profile, builder: GCodeBu
                     actions.append("layer_marker")
             patched.append(line)
         return patched
-    elif count_layers(body) == 0:
+    if body.count(LAYER_BEFORE_MARKER) == 0 and body.count(LAYER_CHANGE_MARKER) > 0:
+        sync = builder.layer_sync()
+        patched: list[str] = []
+        for line in lines:
+            if LAYER_CHANGE_MARKER in line and (not patched or patched[-1].strip() != sync):
+                patched.append(sync)
+                actions.append("layer_marker")
+            patched.append(line)
+        return patched
+    if count_layers(body) == 0:
         patched = list(lines)
         for i, line in enumerate(patched):
             if LAYER_N_MARKER in line:
@@ -1489,7 +1233,7 @@ def repair_layer_marker(lines: list[str], profile: E5S1Profile, builder: GCodeBu
         return patched
     return lines
 
-def repair_gcode(lines: list[str], profile: E5S1Profile, pa_fw: str = "marlin") -> tuple[list[str], list[str]]:
+def repair_gcode(lines: list[str], profile: E5S1Profile, pa_fw: str = PA_FIRMWARE) -> tuple[list[str], list[str]]:
     actions: list[str] = []
     builder = GCodeBuilder(pa_fw)
 
@@ -1516,8 +1260,7 @@ def inject_pa(lines: list[str], pa_fw: str, pa_k: float, builder: GCodeBuilder |
         return lines, None
     builder = builder or GCodeBuilder(pa_fw)
     head = lines[:head_index(lines)]
-    has_pa = any(M900_RE.match(line.strip()) for line in head)
-    if has_pa:
+    if any(M900_RE.match(line.strip()) for line in head):
         return lines, None
     extrusion_idx = next(
         (i for i in range(len(head) - 1, -1, -1) if G1_EXTRUDE_RE.match(head[i].strip())),
@@ -1532,11 +1275,20 @@ def inject_pa(lines: list[str], pa_fw: str, pa_k: float, builder: GCodeBuilder |
     return lines[:extrusion_idx + 1] + [cmd] + lines[extrusion_idx + 1:], f"pa_{pa_fw}_{pa_k}"
 
 class TransformContext:
-    def __init__(self, profile: E5S1Profile, builder: GCodeBuilder, skip_overhang_fan: bool, layer_h: float | None = None):
+    def __init__(
+        self,
+        profile: E5S1Profile,
+        builder: GCodeBuilder,
+        skip_overhang_fan: bool,
+        layer_h: float | None = None,
+        *,
+        uses_before_after_markers: bool = True,
+    ):
         self.profile = profile
         self.builder = builder
         self.skip_overhang_fan = skip_overhang_fan
-        self.layer_h = layer_h or 0.4  # Default to 0.4 layer height if none detected
+        self.uses_before_after_markers = uses_before_after_markers
+        self.layer_h = layer_h or LAYER_HEIGHT_FIRST_MM
         self.out: list[str] = []
         self.actions: list[str] = []
         self.layer_count = 0
@@ -1545,8 +1297,10 @@ class TransformContext:
         self.boost_fan = False
         self.cool_boost = False
         self.flow_bridge = False
+        self.seam_flow = False
         self.surface_kind: str | None = None
         self.last_f = profile["default_motion_f"]
+        self.last_pa_k: float | None = None
         self.skip_fan_at: set[int] = set()
         self.current_line = ""
         self.current_upper = ""
@@ -1556,10 +1310,30 @@ class TransformContext:
         self.current_upper = line.upper()
 
     def reset_flow(self) -> None:
-        if self.flow_bridge:
+        if self.flow_bridge or self.seam_flow:
             self.out.append(self.builder.flow_reset())
             self.actions.append("flow_reset")
             self.flow_bridge = False
+            self.seam_flow = False
+
+    def apply_pa(self, feat: str) -> None:
+        if self.builder.pa_fw != PA_FIRMWARE or self.profile["pa_k"] <= 0:
+            return
+        scale = 1.0
+        if feat in ("external", "perimeter"):
+            scale = PA_PERIMETER_SCALE
+        elif feat in ("internal", "solid"):
+            scale = PA_INFILL_SCALE
+        elif feat in ("bridge", "overhang"):
+            scale = PA_BRIDGE_SCALE
+        elif feat == "ironing":
+            scale = PA_IRONING_SCALE
+        k = round(self.profile["pa_k"] * scale, 4)
+        if k == self.last_pa_k:
+            return
+        self.out.append(self.builder.pressure_advance(k))
+        self.actions.append(f"pa_dynamic_K{k}")
+        self.last_pa_k = k
 
     def restore_layer_fan(self) -> None:
         if self.layer_fan_cap is not None:
@@ -1628,6 +1402,7 @@ def transform_feature_type(ctx: TransformContext, lines: list[str], idx: int) ->
         elif not ctx.skip_overhang_fan:
             ctx.out.append(ctx.builder.fan_command("overhang", ctx.profile["overhang_fan_pwm"]))
             ctx.actions.append("fan_overhang")
+        ctx.apply_pa(feat)
         ctx.boost_fan = True
         ctx.cool_boost = True
         ctx.surface_kind = feat
@@ -1641,23 +1416,14 @@ def transform_feature_type(ctx: TransformContext, lines: list[str], idx: int) ->
 
         ctx.boost_fan = feat in ("top", "ironing", "interface", "support", "bottom", "external", "perimeter", "brim", "bridge", "overhang")
 
-        # Dynamically adjust Linear Advance for Marlin
-        if ctx.builder.pa_fw == "marlin" and ctx.profile["pa_k"] > 0:
-            scale = 1.0
-            if feat in ("external", "perimeter"):
-                scale = PA_PERIMETER_SCALE
-            elif feat in ("internal", "solid", "infill"):
-                scale = PA_INFILL_SCALE
-            elif feat in ("bridge", "overhang"):
-                scale = PA_BRIDGE_SCALE
-            elif feat == "ironing":
-                scale = PA_IRONING_SCALE
-            k = round(ctx.profile["pa_k"] * scale, 4)
-            ctx.out.append(ctx.builder.pressure_advance(k))
-            ctx.actions.append(f"pa_dynamic_K{k}")
+        ctx.apply_pa(feat)
 
         if feat in ("external", "perimeter", "top", "ironing", "interface", "support", "bottom", "brim"):
             ctx.out.append(ctx.current_line)
+            if feat in ("external", "perimeter"):
+                ctx.out.append(ctx.builder.flow_seam(ctx.profile["seam_flow_pct"]))
+                ctx.seam_flow = True
+                ctx.actions.append(f"flow_seam_S{ctx.profile['seam_flow_pct']}")
             skip_idx = tune_fan_speed(
                 ctx.out, ctx.actions, feat, lines, idx, ctx.layer_count, ctx.layer_fan_cap, ctx.profile, ctx.builder
             )
@@ -1667,6 +1433,7 @@ def transform_feature_type(ctx: TransformContext, lines: list[str], idx: int) ->
             return True
 
         if feat == "other":
+            ctx.out.append(ctx.current_line)
             ctx.surface_kind = None
             ctx.boost_fan = False
             return True
@@ -1696,8 +1463,11 @@ def transform_layer_boundary(ctx: TransformContext, lines: list[str], idx: int) 
             ctx.restore_layer_fan()
         ctx.reset_flow()
         if LAYER_BEFORE_MARKER in ctx.current_line and LAYER_RETRACT and ctx.layer_count >= 1 and not recent_retract(ctx.out):
-            ctx.out.extend(layer_retract_lines(ctx.profile, ctx.builder))
+            seam_extra = ctx.surface_kind in ("external", "perimeter")
+            ctx.out.extend(layer_retract_lines(ctx.profile, ctx.builder, seam_extra=seam_extra))
             ctx.actions.append("retract_layer")
+            if seam_extra and ctx.profile["seam_extra_retract"] > 0:
+                ctx.actions.append("seam_extra_retract")
         ctx.boost_fan = False
         ctx.cool_boost = False
         ctx.surface_kind = None
@@ -1705,7 +1475,7 @@ def transform_layer_boundary(ctx: TransformContext, lines: list[str], idx: int) 
         return True
     if LAYER_CHANGE_MARKER in ctx.current_line:
         ctx.in_startup = False
-        if ctx.layer_count == 0:
+        if not ctx.uses_before_after_markers or ctx.layer_count == 0:
             if ctx.cool_boost:
                 ctx.restore_layer_fan()
             ctx.reset_flow()
@@ -1719,7 +1489,7 @@ def transform_layer_boundary(ctx: TransformContext, lines: list[str], idx: int) 
     return False
 
 def transform_accel_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool:
-    if (m204_m := M204_S_RE.match(ctx.current_line) if 1 <= ctx.layer_count <= M204_CAP_LAYERS else None):
+    if (m204_m := M204_S_RE.match(ctx.current_line) if 1 <= ctx.layer_count <= LAYER_FIRST_MOTION else None):
         cap_accel = ctx.profile["first_layer_accel"]
         if int(m204_m.group(1)) > cap_accel:
             ctx.out.append(
@@ -1755,12 +1525,12 @@ def transform_speed_cap(ctx: TransformContext, lines: list[str], idx: int) -> bo
         f_cap = speed_cap_for(ctx.surface_kind, ctx.layer_count, ctx.in_startup, ctx.profile)
 
         # Volumetric Flow Rate Cap Calculation
-        w = ctx.profile.get("nozzle_diameter_mm", 0.8)
+        w = ctx.profile.get("nozzle_diameter_mm", NOZZLE_DIAMETER_MM)
         h = ctx.profile["first_layer_height_mm"] if (ctx.layer_count <= 1 or ctx.in_startup) else ctx.layer_h
         volume_per_mm = w * h
         if volume_per_mm > 0:
             max_speed_mm_s = ctx.profile["max_volumetric_flow"] / volume_per_mm
-            flow_cap_f = int(max_speed_mm_s * 60)
+            flow_cap_f = int(max_speed_mm_s * MM_S_TO_F)
             if f_cap is None or flow_cap_f < f_cap:
                 f_cap = flow_cap_f
 
@@ -1776,16 +1546,26 @@ def transform_gcode(
     lines: list[str],
     *,
     analysis: GcodeAnalysis,
-    prusa_cfg: dict[str, str] | None = None,
 ) -> tuple[list[str], list[str]]:
-    bundle = get_bundle_config()
-    profile = build_e5s1_profile(prusa_cfg, bundle)
-    pa_fw = resolve_pa_firmware("\n".join(lines[:PA_PROBE_LINES]))
+    profile = build_e5s1_profile()
+    pa_fw = resolve_pa_firmware()
     need_sup = analysis["needs_support"]
     skip_overhang_fan = analysis["large"] and analysis["overhang_markers"] > OVERHANG_FAN_SKIP_THRESHOLD and not need_sup
 
+    uses_before_after = any(
+        marker in line
+        for line in lines[:head_index(lines)]
+        for marker in (LAYER_BEFORE_MARKER, AFTER_LAYER_MARKER)
+    )
+
     builder = GCodeBuilder(pa_fw)
-    ctx = TransformContext(profile, builder, skip_overhang_fan, analysis.get("layer_h"))
+    ctx = TransformContext(
+        profile,
+        builder,
+        skip_overhang_fan,
+        analysis.get("layer_h"),
+        uses_before_after_markers=uses_before_after,
+    )
 
     transformers = [
         transform_speed_tracking,
@@ -1826,28 +1606,15 @@ def transform_gcode(
     return out, ctx.actions
 
 def _export_search_dirs() -> tuple[Path, ...]:
-    dirs = [
-        Path.home() / "Downloads",
-        Path.home() / "Documentos",
-        Path.home() / "Documents",
-    ]
-    extra = os.environ.get("E5S1_EXPORT_DIR", "").strip()
+    dirs = [Path.home() / name for name in EXPORT_FOLDER_NAMES]
+    extra = os.environ.get(ENV_E5S1_EXPORT_DIR, "").strip()
     if extra:
         dirs.append(Path(extra))
     return tuple(dirs)
 
 EXPORT_SEARCH_DIRS = _export_search_dirs()
 
-class IExportFinder(abc.ABC):
-    @abc.abstractmethod
-    def find_recent_export(self, max_age_s: int = 300, max_files: int = 5) -> Path | None:
-        pass
-
-    @abc.abstractmethod
-    def path_note(self, path: Path, argv: list[str] | None = None, export: Path | None = None) -> str:
-        pass
-
-class RecentExportFinder(IExportFinder):
+class RecentExportFinder:
     def _recent_gcode_candidates(self, folder: Path, now: float, max_age_s: int, max_files: int) -> list[Path]:
         heap: list[tuple[float, int, Path]] = []
         seq = 0
@@ -1872,7 +1639,7 @@ class RecentExportFinder(IExportFinder):
             return []
         return [path for _, _, path in sorted(heap, key=lambda item: (-item[0], -item[1]))]
 
-    def find_recent_export(self, max_age_s: int = 300, max_files: int = 5) -> Path | None:
+    def find_recent_export(self, max_age_s: int = EXPORT_MAX_AGE_S, max_files: int = EXPORT_MAX_FILES) -> Path | None:
         now = time.time()
         for folder in EXPORT_SEARCH_DIRS:
             if not folder.is_dir():
@@ -1899,16 +1666,7 @@ class RecentExportFinder(IExportFinder):
             note += f" | argv_extra={argv[1:]}"
         return note
 
-class IStateLogger(abc.ABC):
-    @abc.abstractmethod
-    def log(self, event: str, message: str = "", echo: bool = True) -> None:
-        pass
-
-    @abc.abstractmethod
-    def write_state(self, data: dict) -> None:
-        pass
-
-class StateLogger(IStateLogger):
+class StateLogger:
     def __init__(self):
         self._ensure_log_dir()
 
@@ -1927,44 +1685,8 @@ class StateLogger(IStateLogger):
         self._ensure_log_dir()
         STATE_FILE.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
-class LoggerFactory:
-    _instance: IStateLogger | None = None
-
-    @classmethod
-    def get_instance(cls) -> IStateLogger:
-        if cls._instance is None:
-            cls._instance = StateLogger()
-        return cls._instance
-
-class ILogger(abc.ABC):
-    @abc.abstractmethod
-    def log_result(
-        self,
-        event: str,
-        note: str,
-        errors: list[str],
-        warnings: list[str],
-        text: str,
-        quiet: bool,
-        extra: list[str] | None = None,
-        analysis: GcodeAnalysis | None = None,
-    ) -> None:
-        pass
-
-    @abc.abstractmethod
-    def log_state_warn(self, msg: str, quiet: bool) -> None:
-        pass
-
-    @abc.abstractmethod
-    def log_fail(self, note: str, quiet: bool) -> None:
-        pass
-
-    @abc.abstractmethod
-    def format_actions(self, actions: list[str]) -> str:
-        pass
-
-class DefaultLogger(ILogger):
-    def __init__(self, state_logger: IStateLogger, analyzer: GCodeAnalyzer):
+class DefaultLogger:
+    def __init__(self, state_logger: StateLogger, analyzer: GCodeAnalyzer):
         self.state_logger = state_logger
         self.analyzer = analyzer
 
@@ -2009,16 +1731,16 @@ class DefaultLogger(ILogger):
 class PostProcessApp:
     def __init__(
         self,
-        logger: ILogger | None = None,
+        logger: DefaultLogger | None = None,
         analyzer: GCodeAnalyzer | None = None,
         validator: GCodeValidator | None = None,
-        export_finder: IExportFinder | None = None,
-        state_logger: IStateLogger | None = None,
+        export_finder: RecentExportFinder | None = None,
+        state_logger: StateLogger | None = None,
     ):
         self.analyzer = analyzer or GCodeAnalyzer()
         self.validator = validator or GCodeValidator(self.analyzer)
         self.export_finder = export_finder or RecentExportFinder()
-        self.state_logger = state_logger or LoggerFactory.get_instance()
+        self.state_logger = state_logger or StateLogger()
 
         if logger is None:
             self.logger = DefaultLogger(self.state_logger, self.analyzer)
@@ -2055,11 +1777,9 @@ class PostProcessApp:
                 continue
 
             analysis = self.analyzer.analyze(raw, hint)
-            prusa_cfg = parse_prusa_config(raw)
             new_lines, actions = transform_gcode(
                 strip_pp_lines(raw.splitlines(), full=force),
                 analysis=analysis,
-                prusa_cfg=prusa_cfg,
             )
 
             result = "\n".join(new_lines) + "\n"
@@ -2112,8 +1832,6 @@ def run_postprocess(
 ) -> int:
     app = PostProcessApp()
     return app.run(paths, quiet, force, argv)
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 if __name__ == "__main__":
     argv = sys.argv[1:]
