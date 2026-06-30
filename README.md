@@ -1,19 +1,19 @@
 # E5S1 G-code Post-Process
 
-G-code post-processor tuned for the **Creality Ender-5 S1** with a **0.8 mm high-flow nozzle** (Spider hotend). Not a generic slicer profile — speed caps, fan curves, retraction, pressure advance, and skirt geometry assume this printer and nozzle size.
+Pós-processador de G-code calibrado para a **Creality Ender-5 S1** com bico **0.8 mm high-flow** (hotend Spider). Não é um perfil genérico de fatiador — limites de velocidade, curvas de ventoinha, retração, pressure advance e geometria de saia assumem esta impressora e este diâmetro de bico.
 
-PrusaSlicer supplies sliced geometry; this pipeline injects machine-specific fan ramps, flow tuning, seam handling, pressure advance, startup repair, and skirt adhesion.
+O PrusaSlicer fornece a geometria fatiada; este pipeline injeta rampas de fan, ajuste de fluxo, tratamento de costura, PA, reparo de startup e saia de adesão específicos da máquina.
 
-No external config required — all tuning lives in the constants block at the top of `scripts/gcode_postprocess.py` (lines ~16–275). Edit those values to change behavior. The optional `; prusaslicer_config` tail in exported G-code is read **only for analysis** (layer count, layer height, logs) — it does not override tuning.
+Nenhuma config externa é necessária — todo o tuning está no bloco de constantes no topo de `scripts/gcode_postprocess.py`. Edite esses valores para alterar o comportamento. O bloco opcional `; prusaslicer_config` no final do G-code é lido **somente para análise** (contagem de camadas, layer height, logs) — **não** sobrescreve o perfil hardcoded.
 
 ## Stack
 
-- Python 3.11+ (stdlib only — no third-party dependencies)
-- PrusaSlicer 2.x (`post_process` hook)
-- Target printer: **Creality Ender-5 S1**, **0.8 mm nozzle**
-- Target firmware: **Marlin** (linear advance via `M900 K`)
+- Python 3.11+ (stdlib only — sem dependências de terceiros)
+- PrusaSlicer 2.x (hook `post_process`)
+- Impressora alvo: **Creality Ender-5 S1**, bico **0.8 mm**
+- Firmware alvo: **Marlin** (linear advance via `M900 K`)
 
-## Quick setup
+## Setup rápido
 
 ```bash
 git clone https://github.com/LuizEduPP/e5s1-gcode-postprocess.git
@@ -22,25 +22,25 @@ python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 ```
 
-In PrusaSlicer → **Print Settings → Output options → Post-processing scripts**, add:
+No PrusaSlicer → **Print Settings → Output options → Post-processing scripts**, adicione:
 
 ```ini
-python3 /absolute/path/to/scripts/gcode_postprocess.py
+python3 /caminho/absoluto/para/scripts/gcode_postprocess.py
 ```
 
-Use the absolute path to `gcode_postprocess.py`. PrusaSlicer passes the exported G-code file path as the first argument on every slice.
+Use o caminho absoluto para `gcode_postprocess.py`. O PrusaSlicer passa o caminho do G-code exportado como primeiro argumento a cada fatiamento.
 
-## Environment variables
+## Variáveis de ambiente
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `E5S1_EXPORT_DIR` | No | Extra folder to scan for recent post-processed exports (default: `~/Downloads`, `~/Documents`, `~/Documentos`) |
+| Variável | Obrigatória | Descrição |
+|----------|-------------|-----------|
+| `E5S1_EXPORT_DIR` | Não | Pasta extra para buscar exports recentes pós-processados (padrão: `~/Downloads`, `~/Documents`, `~/Documentos`) |
 
-Machine tuning for the Ender-5 S1 / 0.8 mm setup is in the consolidated constants block at the top of `scripts/gcode_postprocess.py` (`PA_K`, `FLOW_RAMP`, `FAN_*`, `RETRACT_*`, `SEAM_*`, `SKIRT_*`, etc.).
+Tuning da Ender-5 S1 / 0.8 mm: constantes no topo de `scripts/gcode_postprocess.py` (`PA_K`, `FLOW_RAMP`, `FAN_*`, `RETRACT_*`, `SEAM_*`, `SKIRT_*`, etc.). Contratos tipados: `E5S1Profile`, `GcodeAnalysis`, `GcodeStats` (`TypedDict`).
 
-## Commands
+## Comandos
 
-Post-process one or more files manually (verbose output):
+Pós-processar um ou mais arquivos manualmente (saída verbosa):
 
 ```bash
 python3 -c "
@@ -52,41 +52,60 @@ sys.exit(run_postprocess([Path('model.gcode')], quiet=False))
 "
 ```
 
-PrusaSlicer entry point (quiet, used automatically after each export):
+Ponto de entrada do PrusaSlicer (silencioso, após cada export):
 
 ```bash
 python3 scripts/gcode_postprocess.py /path/to/model.gcode
 ```
 
-Logs and last-run state are written to `logs/` (gitignored).
+Logs e estado da última execução: `logs/` (gitignored).
 
-## Architecture
+## Arquitetura
 
-Single-file pipeline in `scripts/gcode_postprocess.py`:
+Pipeline monolítico em `scripts/gcode_postprocess.py` (~1900 linhas):
 
 ```
-read G-code → analyze (metadata from prusaslicer_config tail) → build hardcoded E5S1 profile
-    → transform (fan ramp, flow, caps, seams, bridges) → repair startup/skirt/PA → validate → write in place
+PostProcessApp.run()
+  → parse_prusa_config (1× por arquivo)
+  → analyze → GcodeAnalysis
+  → strip_pp_lines (dedupe PA se reprocessamento)
+  → transform_gcode
+       · transformadores por linha (fan, flow, caps, seams, bridges, camadas)
+       · repair_startup (G28, mesh, M109, purge, Z-fix, saia)
+       · repair_small_perimeters
+       · repair_layer_marker
+       · inject_pa
+  → validate → write in place
+  → analyze pós-transform + stats em logs/e5s1_state.json
 ```
 
-**Idempotency:** files containing `; --- E5S1 postprocess ---` are skipped unless re-run with `force=True` via `run_postprocess()`.
+**Transformadores** (ordem fixa): tracking de F, macro de startup, cabeçalho/marcador, `;TYPE:` features, fan de ironing, fronteira de camada, cap de aceleração, cap de fan, cap de velocidade/volumétrico.
 
-## Hardware profile (defaults)
+**Reparos pós-transform:**
+- **Startup** — homing, mesh, M109, purge, correção de Z absoluto (ignora `G91`), `G90` antes de purge/saia se o head terminar em relativo
+- **Perímetros pequenos** — boost de fluxo + cap de F em segmentos &lt; 20 mm
+- **Marcadores de camada** — normaliza `;BEFORE_LAYER_CHANGE` / sync quando ausentes
 
-Calibrated for **Ender-5 S1 + 0.8 mm nozzle**. Values below match the constants block in `scripts/gcode_postprocess.py`:
+**Idempotência:** arquivos com `; --- E5S1 postprocess ---` são ignorados, salvo `force=True` em `run_postprocess()`.
 
-| Parameter | Value |
+**Análise vs tuning:** `parse_prusa_config` alimenta contagem de camadas e metadados; `build_e5s1_profile()` define PWM, retract, PA e limites de velocidade.
+
+## Perfil de hardware (padrões)
+
+Calibrado para **Ender-5 S1 + bico 0.8 mm** (constantes em `gcode_postprocess.py`):
+
+| Parâmetro | Valor |
 |-----------|-------|
-| Printer | Creality Ender-5 S1 |
-| Nozzle | 0.8 mm (high-flow / Spider) |
-| First layer height | 0.24 mm |
-| Fan off layers | 2 |
-| Full fan layer | 5 |
+| Impressora | Creality Ender-5 S1 |
+| Bico | 0.8 mm (high-flow / Spider) |
+| Altura 1ª camada | 0.24 mm |
+| Camadas sem fan | 2 |
+| Camada fan pleno | 5 |
 | Pressure advance (`PA_K`) | 0.03 |
-| Max volumetric flow | 15 mm³/s |
-| Skirt | 3 loops, 40 mm side, origin (3, 3) mm |
-| Seam flow / join | 96% / 18 mm/s |
+| Fluxo volumétrico máx. | 15 mm³/s |
+| Saia | 3 loops, 40 mm lado, origem (3, 3) mm |
+| Fluxo / join de costura | 96% / 18 mm/s |
 
-## License
+## Licença
 
-MIT — see [LICENSE](LICENSE).
+MIT — veja [LICENSE](LICENSE).
