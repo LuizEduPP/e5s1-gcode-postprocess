@@ -36,7 +36,7 @@ Use the absolute path to `gcode_postprocess.py`. PrusaSlicer passes the exported
 |----------|----------|-------------|
 | `E5S1_EXPORT_DIR` | No | Extra folder to scan for recent post-processed exports (default: `~/Downloads`, `~/Documents`, `~/Documentos`) |
 
-Machine tuning for the Ender-5 S1 / 0.8 mm setup is in `scripts/profile.py` (retraction, fan curves, PA, skirt, seam). Slicer-exported values override defaults when present in the G-code tail block. Other printers or nozzle sizes require editing those constants.
+Machine tuning for the Ender-5 S1 / 0.8 mm setup is in `scripts/config.py` (retraction, fan curves, PA, skirt, seam). Slicer-exported values override defaults when present in the G-code tail block. Other printers or nozzle sizes require editing those constants.
 
 ## Commands
 
@@ -67,17 +67,9 @@ gcode_postprocess.py     PrusaSlicer entry — forwards to pipeline
         │
 gcode_pipeline.py        File I/O, skip-if-processed, validation, logging
         │
-        ├── gcode_checks.py      Analysis (layers, support, overhangs) + validation
-        ├── gcode_export.py      Recent export discovery for state hints
-        └── gcode_transform.py   Main line-by-line transform loop
-                │
-                ├── profile.py           E5S1 defaults + prusaslicer_config merge
-                ├── gcode_tune.py          Fan / seam / speed / retraction tuning
-                ├── gcode_repair.py        Startup fix, skirt injection, PA (M900)
-                ├── gcode_features.py      ;TYPE feature classification
-                ├── gcode_emit.py          Injected G-code line builders
-                ├── gcode_patterns.py      Shared regex + strip helpers
-                └── config.py              Markers, TYPE tags, scan limits
+        ├── config.py            Constants, bundle.ini loader, profile settings, state logging, recent export finding
+        ├── gcode_utils.py       Regex patterns, feature scanner, emitters, analysis & validation
+        └── gcode_process.py     Tuning logic, G-code repair steps, transformation loop
 ```
 
 **Flow:** read G-code → parse optional `; prusaslicer_config` tail → build runtime profile → transform (fan ramp, flow, caps, seams, bridges) → repair startup/skirt/PA → validate → write in place.
@@ -86,7 +78,7 @@ gcode_pipeline.py        File I/O, skip-if-processed, validation, logging
 
 ## Hardware profile (defaults)
 
-Calibrated for **Ender-5 S1 + 0.8 mm nozzle**. Values below are the built-in baseline in `profile.py`:
+Calibrated for **Ender-5 S1 + 0.8 mm nozzle**. Values below are the built-in baseline in `config.py`:
 
 | Parameter | Value |
 |-----------|-------|
