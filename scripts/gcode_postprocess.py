@@ -133,6 +133,7 @@ LAYER_RETRACT_WIPE_E_MM = 0.15
 TRAVEL_COAST_MIN_MM = 5.0
 DERETRACT_F = 700
 DERETRACT_MAX_E_MM = 0.35
+SLICER_DERETRACT_MAX_E_MM = 1.2
 FIRST_LAYER_INTERNAL_WALL_FACTOR = 1.15
 FIRST_LAYER_INFILL_FACTOR = 1.2
 
@@ -477,10 +478,26 @@ def _coast_e_on_line(line: str, coast_e: float, *, min_remain: float = COAST_MIN
     e_val = float(m.group(1))
     if e_val <= 0:
         return None
-    new_e = max(min_remain, e_val - coast_e)
-    if new_e >= e_val - 1e-9:
+    if e_val - coast_e < min_remain:
         return None
+    new_e = e_val - coast_e
     return E_VAL_RE.sub(f"E{new_e:.5f}", line, count=1)
+
+def _coast_blocked_before_travel(lines: list[str], ext_i: int, travel_i: int) -> bool:
+    for j in range(ext_i + 1, travel_i):
+        low = lines[j].lower()
+        if "wipe_start" in low or "wipe_end" in low:
+            return True
+        stripped = lines[j].strip()
+        if RETRACT_RE.match(stripped):
+            return True
+        if G91_RE.match(stripped):
+            return True
+        if "postprocess layer retract" in low or "postprocess retract wipe" in low:
+            return True
+        if any(m in lines[j] for m in LAYER_MARKERS):
+            return True
+    return False
 
 def uses_before_after_markers(lines: list[str]) -> bool:
     return any(LAYER_BEFORE_MARKER in line or AFTER_LAYER_MARKER in line for line in lines)
@@ -1631,6 +1648,9 @@ def repair_travel_coast(lines: list[str], actions: list[str]) -> list[str]:
         elif step >= TRAVEL_COAST_MIN_MM and last_ext_i is not None and "postprocess coast" not in out[last_ext_i]:
             if i - last_ext_i <= COAST_LAYER_GUARD_LINES:
                 continue
+            if _coast_blocked_before_travel(out, last_ext_i, i):
+                last_ext_i = None
+                continue
             new_line = _coast_e_on_line(out[last_ext_i], COAST_E_MM)
             if new_line:
                 out[last_ext_i] = new_line + " ; postprocess coast travel"
@@ -1643,6 +1663,55 @@ def repair_travel_coast(lines: list[str], actions: list[str]) -> list[str]:
     if coasted:
         actions.append(f"coast_travel×{coasted}")
     return out
+
+def _e_only_positive(line: str) -> float | None:
+    stripped = line.strip().upper()
+    if not stripped.startswith("G1"):
+        return None
+    m_e = E_VAL_RE.search(stripped)
+    if not m_e:
+        return None
+    e_val = float(m_e.group(1))
+    if e_val <= 0:
+        return None
+    if X_VAL_RE.search(stripped) or Y_VAL_RE.search(stripped) or Z_VAL_RE.search(stripped):
+        return None
+    return e_val
+
+def _after_slicer_wipe(lines: list[str], idx: int, lookback: int = 16) -> bool:
+    for j in range(idx - 1, max(idx - lookback, -1), -1):
+        low = lines[j].lower()
+        if "wipe_end" in low:
+            return True
+        if any(m in lines[j] for m in LAYER_MARKERS):
+            return False
+        stripped = lines[j].strip()
+        if G1_EXTRUDE_RE.match(stripped):
+            m = E_VAL_RE.search(stripped.upper())
+            if m and float(m.group(1)) > COAST_MIN_REMAIN_E_MM:
+                return False
+    return False
+
+def _slow_deretract_line(
+    out: list[str],
+    idx: int,
+    profile: E5S1Profile,
+    builder: GCodeBuilder,
+    *,
+    max_e: float,
+) -> bool:
+    if "deretract slow" in out[idx].lower():
+        return False
+    e_val = _e_only_positive(out[idx])
+    if e_val is None or e_val > max_e:
+        return False
+    head = out[idx].split(";", 1)[0].rstrip()
+    if F_RE.search(head):
+        head = F_RE.sub(f"F{DERETRACT_F}", head, count=1)
+    else:
+        head = f"{head} F{DERETRACT_F}"
+    out[idx] = f"{head} ; postprocess deretract slow"
+    return True
 
 def repair_deretract(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
     out = list(lines)
@@ -1658,15 +1727,13 @@ def repair_deretract(lines: list[str], profile: E5S1Profile, builder: GCodeBuild
                 m = E_VAL_RE.search(stripped)
                 if not m:
                     break
-                e_val = float(m.group(1))
-                if e_val <= 0:
+                if float(m.group(1)) <= 0:
                     break
-                if e_val <= DERETRACT_MAX_E_MM and "deretract" not in out[j]:
-                    new_line, capped, _ = cap_f_line(out[j], DERETRACT_F, profile["retract_f"], builder)
-                    if capped or DERETRACT_F < profile["retract_f"]:
-                        out[j] = new_line + " ; postprocess deretract slow"
-                        slowed += 1
+                if _slow_deretract_line(out, j, profile, builder, max_e=DERETRACT_MAX_E_MM):
+                    slowed += 1
                 break
+        elif _after_slicer_wipe(out, i) and _slow_deretract_line(out, i, profile, builder, max_e=SLICER_DERETRACT_MAX_E_MM):
+            slowed += 1
         i += 1
     if slowed:
         actions.append(f"deretract_slow×{slowed}")
@@ -2005,6 +2072,9 @@ def transform_speed_cap(ctx: TransformContext, lines: list[str], idx: int) -> bo
         if ctx.pending_surface_clear:
             ctx.surface_kind = None
             ctx.pending_surface_clear = False
+        if _e_only_positive(ctx.current_line) is not None:
+            ctx.out.append(ctx.current_line)
+            return True
         f_cap = speed_cap_for(ctx.surface_kind, ctx.layer_count, ctx.in_startup, ctx.profile)
 
         w = ctx.profile["nozzle_diameter_mm"]
