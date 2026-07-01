@@ -1692,6 +1692,27 @@ def _after_slicer_wipe(lines: list[str], idx: int, lookback: int = 16) -> bool:
                 return False
     return False
 
+def _after_layer_travel(lines: list[str], idx: int, lookback: int = 20) -> bool:
+    if _e_only_positive(lines[idx]) is None:
+        return False
+    seen_z_up = False
+    for j in range(idx - 1, max(idx - lookback, -1), -1):
+        low = lines[j].lower()
+        if AFTER_LAYER_MARKER in lines[j] or "wipe_end" in low:
+            return True
+        if LAYER_BEFORE_MARKER in lines[j]:
+            return False
+        upper = lines[j].strip().upper()
+        if upper.startswith("G1") and " Z" in upper:
+            zm = Z_VAL_RE.search(upper)
+            if zm and float(zm.group(1)) >= 0.4:
+                seen_z_up = True
+        if seen_z_up and G1_EXTRUDE_RE.match(lines[j].strip()):
+            m = E_VAL_RE.search(upper)
+            if m and float(m.group(1)) > COAST_MIN_REMAIN_E_MM:
+                return False
+    return False
+
 def _slow_deretract_line(
     out: list[str],
     idx: int,
@@ -1732,11 +1753,83 @@ def repair_deretract(lines: list[str], profile: E5S1Profile, builder: GCodeBuild
                 if _slow_deretract_line(out, j, profile, builder, max_e=DERETRACT_MAX_E_MM):
                     slowed += 1
                 break
-        elif _after_slicer_wipe(out, i) and _slow_deretract_line(out, i, profile, builder, max_e=SLICER_DERETRACT_MAX_E_MM):
+        elif (_after_slicer_wipe(out, i) or _after_layer_travel(out, i)) and _slow_deretract_line(
+            out, i, profile, builder, max_e=SLICER_DERETRACT_MAX_E_MM,
+        ):
             slowed += 1
         i += 1
     if slowed:
         actions.append(f"deretract_slow×{slowed}")
+    return out
+
+def _pp_retract_before_marker(lines: list[str], marker_idx: int, lookback: int = 32) -> bool:
+    for j in range(marker_idx - 1, max(marker_idx - lookback, -1), -1):
+        if "postprocess layer retract" in lines[j].lower():
+            return True
+        if LAYER_CHANGE_MARKER in lines[j]:
+            break
+    return False
+
+def _stale_slicer_retract(line: str) -> bool:
+    low = line.lower()
+    if any(k in low for k in ("postprocess layer retract", "postprocess retract wipe", "postprocess z hop")):
+        return False
+    stripped = line.strip()
+    if not RETRACT_RE.match(stripped):
+        return False
+    if X_VAL_RE.search(stripped) or Y_VAL_RE.search(stripped):
+        return False
+    m = E_VAL_RE.search(stripped.upper())
+    return m is not None and abs(float(m.group(1))) <= 1.5
+
+def repair_stale_layer_wipe(lines: list[str], actions: list[str]) -> list[str]:
+    """Drop slicer end-of-layer retract/wipe between BEFORE and AFTER when PP already retracted."""
+    out: list[str] = []
+    removed = 0
+    i = 0
+    n = len(lines)
+    while i < n:
+        if LAYER_BEFORE_MARKER not in lines[i]:
+            out.append(lines[i])
+            i += 1
+            continue
+        after_end = i + 1
+        while after_end < n and AFTER_LAYER_MARKER not in lines[after_end]:
+            after_end += 1
+        if after_end >= n:
+            out.extend(lines[i:])
+            break
+        block = lines[i : after_end + 1]
+        if _pp_retract_before_marker(lines, i):
+            cleaned: list[str] = []
+            skip_until = 0
+            for bi, ln in enumerate(block):
+                if bi < skip_until:
+                    continue
+                if ln.strip().startswith(";WIPE_START"):
+                    prev = bi - 1
+                    while prev >= 0 and not block[prev].strip():
+                        prev -= 1
+                    if prev >= 0 and _stale_slicer_retract(block[prev]):
+                        if cleaned and _stale_slicer_retract(cleaned[-1]):
+                            cleaned.pop()
+                            removed += 1
+                    end = bi + 1
+                    while end < len(block) and ";WIPE_END" not in block[end]:
+                        end += 1
+                    skip_until = min(end + 1, len(block))
+                    removed += 1
+                    continue
+                if _stale_slicer_retract(ln):
+                    removed += 1
+                    continue
+                cleaned.append(ln)
+            out.extend(cleaned)
+        else:
+            out.extend(block)
+        i = after_end + 1
+    if removed:
+        actions.append(f"stale_wipe_removed×{removed}")
     return out
 
 def repair_layer_marker(
@@ -2002,12 +2095,22 @@ def transform_ironing_fan(ctx: TransformContext, lines: list[str], idx: int) -> 
     return False
 
 def transform_layer_boundary(ctx: TransformContext, lines: list[str], idx: int) -> bool:
-    if LAYER_BEFORE_MARKER in ctx.current_line or AFTER_LAYER_MARKER in ctx.current_line:
+    if AFTER_LAYER_MARKER in ctx.current_line and ctx.uses_before_after_markers:
         ctx.in_startup = False
         if ctx.cool_boost:
             ctx.restore_layer_fan()
         ctx.reset_flow()
-        if LAYER_BEFORE_MARKER in ctx.current_line and LAYER_RETRACT and ctx.layer_count >= 1 and not recent_retract(ctx.out):
+        ctx.boost_fan = False
+        ctx.cool_boost = False
+        ctx.pending_surface_clear = True
+        ctx.out.append(ctx.current_line)
+        return True
+    if LAYER_BEFORE_MARKER in ctx.current_line:
+        ctx.in_startup = False
+        if ctx.cool_boost:
+            ctx.restore_layer_fan()
+        ctx.reset_flow()
+        if LAYER_RETRACT and ctx.layer_count >= 1 and not recent_retract(ctx.out):
             if not _slicer_layer_prep_before(lines, idx):
                 seam_extra = ctx.surface_kind in FEAT_SEAM
                 ctx.out.extend(layer_retract_lines(
@@ -2016,6 +2119,16 @@ def transform_layer_boundary(ctx: TransformContext, lines: list[str], idx: int) 
                 ctx.actions.append("retract_layer")
                 if seam_extra and ctx.profile["seam_extra_retract"] > 0:
                     ctx.actions.append("seam_extra_retract")
+        ctx.boost_fan = False
+        ctx.cool_boost = False
+        ctx.pending_surface_clear = True
+        ctx.begin_layer(ctx.current_line)
+        return True
+    if AFTER_LAYER_MARKER in ctx.current_line:
+        ctx.in_startup = False
+        if ctx.cool_boost:
+            ctx.restore_layer_fan()
+        ctx.reset_flow()
         ctx.boost_fan = False
         ctx.cool_boost = False
         ctx.pending_surface_clear = True
@@ -2170,6 +2283,7 @@ def transform_gcode(
     out = repair_coast(out, repair_actions)
     out = repair_travel_coast(out, repair_actions)
     out = repair_deretract(out, profile, builder, repair_actions)
+    out = repair_stale_layer_wipe(out, repair_actions)
     out = repair_layer_marker(out, builder, repair_actions, cfg)
     ctx.actions.extend(repair_actions)
     out = strip_pp_lines(out)
