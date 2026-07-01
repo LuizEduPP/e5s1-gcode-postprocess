@@ -71,19 +71,23 @@ PostProcessApp.run()
   → strip_pp_lines (dedupe PA se reprocessamento)
   → transform_gcode
        · transformadores por linha (fan, flow, caps, seams, bridges, camadas)
-       · repair_startup (G28, mesh, M109, purge, Z-fix, saia)
-       · repair_small_perimeters
+       · repair_startup (G28, mesh, M109/M190, purge, Z-fix, brim, saia)
+       · repair_small_perimeters (loops fechados, arcos G2/G3)
+       · repair_coast (anti-fiapo antes da retração de camada)
        · repair_layer_marker
        · inject_pa
   → validate → write in place
-  → analyze pós-transform + stats em logs/e5s1_state.json
+  → analysis_after_transform (cache) + stats em logs/e5s1_state.json
 ```
 
-**Transformadores** (ordem fixa): tracking de F, macro de startup, cabeçalho/marcador, `;TYPE:` features, fan de ironing, fronteira de camada, cap de aceleração, cap de fan, cap de velocidade/volumétrico.
+**Transformadores** (ordem fixa): tracking de F, macro de startup, cabeçalho/marcador, `;TYPE:` features, fan de ironing, fronteira de camada, cap de aceleração, cap de fan, cap de velocidade/volumétrico, cap de travel.
 
 **Reparos pós-transform:**
-- **Startup** — homing, mesh, M109, purge, correção de Z absoluto (ignora `G91`), `G90` antes de purge/saia se o head terminar em relativo
-- **Perímetros pequenos** — boost de fluxo + cap de F em segmentos &lt; 20 mm
+- **Startup** — homing, mesh, M109, **M190** (se só M140), purge, Z-fix (ignora `G91`), `G90` antes de purge/brim/saia
+- **Brim automático** — peça &lt; 45 mm ou overhangs sem suporte (`needs_support`)
+- **Overhangs sem suporte** — **max part cooling** (fan máximo por camada + PWM max em overhang/perímetro); action `max_part_cooling` (sem warning pós-process)
+- **Perímetros / loops pequenos** — arcos G2/G3; loop &lt; 25 mm ou raio &lt; 12 mm: boost 108% nos primeiros ~2 mm, slow fechamento nos últimos 3 mm, fan off em loops &lt; 15 mm (camadas 1–3)
+- **Coast + wipe + deretract** — coast antes de retração de camada e travel &gt; 5 mm; wipe 2 mm após retração; deretract lento F700
 - **Marcadores de camada** — normaliza `;BEFORE_LAYER_CHANGE` / sync quando ausentes
 
 **Idempotência:** arquivos com `; --- E5S1 postprocess ---` são ignorados, salvo `force=True` em `run_postprocess()`.
@@ -102,8 +106,12 @@ Calibrado para **Ender-5 S1 + bico 0.8 mm** (constantes em `gcode_postprocess.py
 | Camadas sem fan | 2 |
 | Camada fan pleno | 5 |
 | Pressure advance (`PA_K`) | 0.03 |
-| Fluxo volumétrico máx. | 15 mm³/s |
-| Saia | 3 loops, 40 mm lado, origem (3, 3) mm |
+| Fluxo volumétrico máx. | 24 mm³/s |
+| Paredes / infill (cap) | 38 / 75 mm/s |
+| Rampa fluxo camada 2 | 93% |
+| Saia | 3 loops, 40 mm lado |
+| Brim auto | 3 loops × 4 mm (peça &lt; 45 mm ou sem suporte) |
+| Skirt offset pequena | 2,5 mm (bbox &lt; 45 mm) |
 | Fluxo / join de costura | 96% / 18 mm/s |
 
 ## Licença

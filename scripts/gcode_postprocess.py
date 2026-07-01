@@ -97,7 +97,11 @@ BED_X_MAX = 218.0
 BED_Y_MIN = 2.0
 BED_Y_MAX = 218.0
 SKIRT_OFFSET_MM = 5.0
+SKIRT_OFFSET_SMALL_MM = 2.5
 SKIRT_MIN_SIDE_MM = 0.1
+STARTUP_SAFE_Z_MM = 10.0
+COAST_MIN_REMAIN_E_MM = 0.02
+COAST_LAYER_GUARD_LINES = 8
 
 PEEK_SLICER_FAN_WINDOW = 24
 PEEK_FAN_GRACE_MOTION = 2
@@ -108,6 +112,29 @@ LARGE_EXTRUDE_LINE_ESTIMATE_MULT = 50
 SMALL_PERIMETER_THRESHOLD_MM = 20.0
 SMALL_PERIMETER_SPEED_CAP_F = 900
 SMALL_PERIMETER_FLOW_BOOST_PCT = 105
+SMALL_LOOP_RADIUS_MM = 12.0
+SMALL_LOOP_PERIMETER_MAX_MM = 25.0
+SMALL_LOOP_CLOSE_MM = 3.0
+SMALL_LOOP_START_BOOST_MM = 2.0
+SMALL_LOOP_START_BOOST_PCT = 108
+SMALL_LOOP_FAN_OFF_LAYERS = 3
+SMALL_LOOP_FAN_OFF_MAX_MM = 15.0
+LOOP_CLOSE_TOL_MM = 0.05
+
+BRIM_AUTO_BBOX_MM = 45.0
+BRIM_WIDTH_MM = 4.0
+BRIM_LOOPS = 3
+BRIM_EXTRUSION_MM_PER_MM = 0.12
+PP_BRIM = "postprocess brim"
+
+COAST_E_MM = 0.35
+LAYER_RETRACT_WIPE_MM = 2.0
+LAYER_RETRACT_WIPE_E_MM = 0.15
+TRAVEL_COAST_MIN_MM = 5.0
+DERETRACT_F = 700
+DERETRACT_MAX_E_MM = 0.35
+FIRST_LAYER_INTERNAL_WALL_FACTOR = 1.15
+FIRST_LAYER_INFILL_FACTOR = 1.2
 
 PA_FIRMWARE = "marlin"
 PA_K = 0.03
@@ -123,7 +150,7 @@ MM_S_TO_F = 60
 NOZZLE_DIAMETER_MM = 0.8
 LAYER_HEIGHT_FIRST_MM = 0.24
 TEMP_FIRST_LAYER_C = "215"
-MAX_VOLUMETRIC_FLOW_MM3_S = 15.0
+MAX_VOLUMETRIC_FLOW_MM3_S = 24.0
 
 RETRACT_LENGTH_MM = 1.2
 RETRACT_SPEED_MM_S = 45.0
@@ -141,10 +168,10 @@ FAN_IRONING_PCT = 35
 FAN_INTERFACE_PCT = 78
 FAN_SUPPORT_PCT = 78
 
-FLOW_RAMP = (100, 88, 92, 96)
+FLOW_RAMP = (100, 93, 92, 96)
 FLOW_BRIDGE_PCT = 95
-NOZZLE_WALL_MM_S = 30
-NOZZLE_INFILL_MM_S = 55
+NOZZLE_WALL_MM_S = 38
+NOZZLE_INFILL_MM_S = 75
 NOZZLE_CAP_MM_S = 25
 NOZZLE_TRAVEL_MM_S = 40
 SPEED_FIRST_LAYER_MM_S = 20.0
@@ -198,6 +225,7 @@ MOTION_RE = re.compile(r"^[GM]\d", re.IGNORECASE)
 M104_RE = re.compile(r"^M104\s+S(\d+)", re.IGNORECASE)
 M109_RE = re.compile(r"^M109\b", re.IGNORECASE | re.MULTILINE)
 M140_RE = re.compile(r"^M140\b", re.IGNORECASE)
+M140_S_RE = re.compile(r"^M140\s+S(\d+)", re.IGNORECASE)
 M190_RE = re.compile(r"^M190\b", re.IGNORECASE)
 M204_S_RE = re.compile(r"^M204\s+S(\d+)", re.IGNORECASE)
 M420_RE = re.compile(r"^M420\b", re.IGNORECASE)
@@ -215,6 +243,8 @@ BED_MESH_RE = re.compile(r"BED_MESH", re.I)
 X_VAL_RE = re.compile(rf"\b[Xx]({AXIS_NUM})")
 Y_VAL_RE = re.compile(rf"\b[Yy]({AXIS_NUM})")
 E_VAL_RE = re.compile(rf"\b[Ee]({AXIS_NUM})")
+I_VAL_RE = re.compile(rf"\b[Ii]({AXIS_NUM})")
+J_VAL_RE = re.compile(rf"\b[Jj]({AXIS_NUM})")
 
 class E5S1Profile(TypedDict):
     retract_mm: float
@@ -415,6 +445,86 @@ def _axis_float(match: re.Match[str] | None) -> float | None:
         return None
     return float(match.group(1))
 
+def _motion_step_mm(line: str, x0: float | None, y0: float | None) -> tuple[float, float | None, float | None]:
+    upper = line.strip().upper()
+    m_x, m_y = X_VAL_RE.search(upper), Y_VAL_RE.search(upper)
+    x1 = _axis_float(m_x) if m_x else x0
+    y1 = _axis_float(m_y) if m_y else y0
+    if x0 is None or y0 is None or x1 is None or y1 is None:
+        return 0.0, x1, y1
+    if upper.startswith("G2") or upper.startswith("G3"):
+        m_i, m_j = I_VAL_RE.search(upper), J_VAL_RE.search(upper)
+        if m_i and m_j:
+            i, j = float(m_i.group(1)), float(m_j.group(1))
+            cx, cy = x0 + i, y0 + j
+            r = math.hypot(i, j)
+            if r > 1e-6:
+                a0 = math.atan2(y0 - cy, x0 - cx)
+                a1 = math.atan2(y1 - cy, x1 - cx)
+                da = a1 - a0
+                if upper.startswith("G2"):
+                    if da > 0:
+                        da -= 2 * math.pi
+                elif da < 0:
+                    da += 2 * math.pi
+                return abs(r * da), x1, y1
+    return math.hypot(x1 - x0, y1 - y0), x1, y1
+
+def _coast_e_on_line(line: str, coast_e: float, *, min_remain: float = COAST_MIN_REMAIN_E_MM) -> str | None:
+    m = E_VAL_RE.search(line)
+    if not m:
+        return None
+    e_val = float(m.group(1))
+    if e_val <= 0:
+        return None
+    new_e = max(min_remain, e_val - coast_e)
+    if new_e >= e_val - 1e-9:
+        return None
+    return E_VAL_RE.sub(f"E{new_e:.5f}", line, count=1)
+
+def uses_before_after_markers(lines: list[str]) -> bool:
+    return any(LAYER_BEFORE_MARKER in line or AFTER_LAYER_MARKER in line for line in lines)
+
+def _scan_bbox_start(lines: list[str]) -> int:
+    start = 0
+    while start < len(lines) and any(m in lines[start] for m in LAYER_MARKERS):
+        start += 1
+    return start
+
+def _skirt_safe_approach(x0: float, y0: float, z_print: float) -> list[str]:
+    return [
+        f"G1 Z{STARTUP_SAFE_Z_MM} F{SKIRT_Z_F} ; postprocess safe z",
+        f"G1 X{x0:.3f} Y{y0:.3f} F{SKIRT_TRAVEL_F} ; postprocess travel",
+        f"G1 Z{z_print:.3f} F{SKIRT_Z_F} ; postprocess skirt",
+    ]
+
+def _slicer_layer_prep_before(lines: list[str], idx: int, lookback: int = 24) -> bool:
+    for j in range(idx - 1, max(idx - lookback, -1), -1):
+        if any(m in lines[j] for m in LAYER_MARKERS):
+            break
+        stripped = lines[j].strip()
+        if G91_RE.match(stripped) or RETRACT_RE.match(stripped):
+            return True
+    return False
+
+def _coast_travel_body_start(lines: list[str]) -> int:
+    for i, line in enumerate(lines):
+        if AFTER_LAYER_MARKER in line or TYPE_EXTERNAL in line or TYPE_PERIMETER in line:
+            return i
+    for i, line in enumerate(lines):
+        if LAYER_CHANGE_MARKER in line:
+            return i + 1
+    return head_index(lines, fallback=0)
+
+def analysis_after_transform(base: GcodeAnalysis, result: str, prusa_cfg: dict[str, str]) -> GcodeAnalysis:
+    updated = dict(base)
+    updated["lines"] = result.count("\n") + (1 if result and not result.endswith("\n") else 0)
+    updated["large"] = len(result) > LARGE_GCODE_BYTES
+    updated["layers"] = count_layers(result, prusa_cfg)
+    _, has_brim = has_skirt_or_brim(result)
+    updated["has_brim"] = has_brim
+    return updated  # type: ignore[return-value]
+
 def count_layers(text: str, prusa_cfg: dict[str, str]) -> int:
     before = text.count(LAYER_BEFORE_MARKER)
     if before:
@@ -446,8 +556,8 @@ def has_skirt_or_brim(text: str | list[str]) -> tuple[bool, bool]:
     else:
         low = text[:SKIRT_BRIM_SCAN_CHARS].lower()
     return (
-        any(t in low for t in (TYPE_SKIRT.lower(), TYPE_SKIRT_BRIM.lower(), "; skirt", "; type:skirt")),
-        TYPE_BRIM.lower() in low or TYPE_OUTER_BRIM.lower() in low,
+        any(t in low for t in (TYPE_SKIRT.lower(), TYPE_SKIRT_BRIM.lower(), "; skirt", "; type:skirt", PP_SKIRT.lower())),
+        TYPE_BRIM.lower() in low or TYPE_OUTER_BRIM.lower() in low or PP_BRIM.lower() in low,
     )
 
 def is_pp_line(line: str, *, pa_only: bool = False) -> bool:
@@ -527,6 +637,12 @@ class GCodeBuilder:
     def layer_retract(self, mm: float, retract_f: int) -> str:
         return f"G1 E-{mm} F{retract_f} ; postprocess layer retract"
 
+    def retract_wipe(self, x: float, y: float, dx: float, e: float, retract_f: int) -> str:
+        return f"G1 X{x + dx:.3f} Y{y:.3f} E-{e:.3f} F{retract_f} ; postprocess retract wipe"
+
+    def wait_bed(self, temp: str | int) -> str:
+        return f"M190 S{temp} ; postprocess wait bed"
+
     def homing(self) -> str:
         return "G28 ; postprocess homing"
 
@@ -572,6 +688,9 @@ G92 E0 ; postprocess purge"""
 
     def skirt_reset_e(self) -> str:
         return f"G92 E0 ; {PP_SKIRT}"
+
+    def brim_comment(self) -> str:
+        return f"; {PP_BRIM}"
 
     def fan_layer(self, pwm: int, layer: int) -> str:
         return f"M106 S{pwm} ; fan postprocess layer {layer}"
@@ -801,10 +920,12 @@ class GCodeValidator:
         if not analysis["layers"]:
             warnings.append("No layer change markers")
 
-        if analysis["needs_support"]:
+        if analysis["needs_support"] and not pp:
             warnings.append(
-                "Overhangs without support material — max part cooling applied; enable support in slicer for best results"
+                "Overhangs without support — enable support in slicer; post-process will apply max cooling + brim"
             )
+        elif analysis["needs_support"] and pp:
+            pass
         elif not pp and not analysis["has_skirt"] and not analysis["has_brim"]:
             warnings.append("No skirt/brim — E5S1 skirt will be injected on post-process")
 
@@ -831,6 +952,12 @@ def speed_cap_for(
         return None
     ceiling = profile["max_print_f"]
     if in_startup or layer_count <= 1:
+        if kind == "external":
+            return min(profile["first_layer_f"], ceiling)
+        if kind in FEAT_INFILL:
+            return min(int(profile["first_layer_f"] * FIRST_LAYER_INFILL_FACTOR), ceiling)
+        if kind in FEAT_WALL:
+            return min(int(profile["first_layer_f"] * FIRST_LAYER_INTERNAL_WALL_FACTOR), ceiling)
         return min(profile["first_layer_f"], ceiling)
     if layer_count <= profile["cap_extrusion_layers"]:
         if kind in FEAT_WALL:
@@ -847,11 +974,20 @@ def speed_cap_for(
         cap = profile["seam_join_f"]
     return cap
 
-def layer_retract_lines(profile: E5S1Profile, builder: GCodeBuilder, *, seam_extra: bool = False) -> list[str]:
+def layer_retract_lines(
+    profile: E5S1Profile,
+    builder: GCodeBuilder,
+    *,
+    seam_extra: bool = False,
+    last_x: float | None = None,
+    last_y: float | None = None,
+) -> list[str]:
     lines: list[str] = []
     if profile["retract_lift"] > 0:
         lines.append(builder.z_hop(profile["retract_lift"]))
     lines.append(builder.layer_retract(profile["retract_mm"], profile["retract_f"]))
+    if last_x is not None and last_y is not None and LAYER_RETRACT_WIPE_MM > 0:
+        lines.append(builder.retract_wipe(last_x, last_y, LAYER_RETRACT_WIPE_MM, LAYER_RETRACT_WIPE_E_MM, profile["retract_f"]))
     if seam_extra and profile["seam_extra_retract"] > 0:
         lines.append(builder.seam_extra_retract(profile["seam_extra_retract"], profile["retract_f"]))
     return lines
@@ -882,19 +1018,43 @@ def peek_slicer_fan(lines: list[str], idx: int, window: int = PEEK_SLICER_FAN_WI
                 break
     return None, None
 
-def e5s1_fan_target_label(kind: str, layer_count: int, layer_fan_cap: int | None, profile: E5S1Profile) -> tuple[int, str] | None:
+def e5s1_fan_target_label(
+    kind: str,
+    layer_count: int,
+    layer_fan_cap: int | None,
+    profile: E5S1Profile,
+    *,
+    max_part_cooling: bool = False,
+) -> tuple[int, str] | None:
     if pwm_key := FAN_PROFILE_KEYS.get(kind):
         return profile[pwm_key], kind
     if kind in FEAT_SEAM and layer_count > profile["fan_off_layers"]:
+        if max_part_cooling:
+            return profile["max_fan_pwm"], "max_cooling"
         pwm = min(profile["seam_fan_pwm"], profile["min_fan_pwm"]) if kind == "perimeter" else profile["seam_fan_pwm"]
         return pwm, "seam"
     if kind in (FEAT_SEAM | {"bottom", "brim"}) and layer_count <= profile["fan_off_layers"]:
         return (layer_fan_cap if layer_fan_cap is not None else 0), "adhesion"
     return None
 
-def tune_fan_speed(out: list[str], actions: list[str], kind: str, lines: list[str], idx: int, layer_count: int, layer_fan_cap: int | None, profile: E5S1Profile, builder: GCodeBuilder) -> int | None:
+def tune_fan_speed(
+    out: list[str],
+    actions: list[str],
+    kind: str,
+    lines: list[str],
+    idx: int,
+    layer_count: int,
+    layer_fan_cap: int | None,
+    profile: E5S1Profile,
+    builder: GCodeBuilder,
+    *,
+    max_part_cooling: bool = False,
+    suppress_fan: bool = False,
+) -> int | None:
+    if suppress_fan:
+        return None
     slicer_fan, fan_idx = peek_slicer_fan(lines, idx)
-    target = e5s1_fan_target_label(kind, layer_count, layer_fan_cap, profile)
+    target = e5s1_fan_target_label(kind, layer_count, layer_fan_cap, profile, max_part_cooling=max_part_cooling)
     if not target:
         return None
     pwm, label = target
@@ -936,12 +1096,16 @@ def scan_bounding_box(lines: list[str]) -> tuple[float, float, float, float] | N
     min_x = min_y = float("inf")
     max_x = max_y = float("-inf")
     has_moves = False
-    scan_end = head_index(lines, fallback=len(lines))
-    if scan_end <= BBOX_SCAN_LIMIT:
-        indices: range = range(scan_end)
+    start = _scan_bbox_start(lines)
+    scan_end = len(lines)
+    span = scan_end - start
+    if span <= 0:
+        return None
+    if span <= BBOX_SCAN_LIMIT:
+        indices: range = range(start, scan_end)
     else:
-        step = max(1, scan_end // BBOX_SCAN_LIMIT)
-        indices = range(0, scan_end, step)
+        step = max(1, span // BBOX_SCAN_LIMIT)
+        indices = range(start, scan_end, step)
 
     for i in indices:
         stripped = lines[i].strip()
@@ -957,12 +1121,11 @@ def scan_bounding_box(lines: list[str]) -> tuple[float, float, float, float] | N
                     y_match = Y_VAL_RE.search(stripped)
                     if x_match:
                         x = _axis_float(x_match)
-                    y = _axis_float(y_match)
-                    if x is not None:
                         min_x = min(min_x, x)
                         max_x = max(max_x, x)
                         has_moves = True
-                    if y is not None:
+                    if y_match:
+                        y = _axis_float(y_match)
                         min_y = min(min_y, y)
                         max_y = max(max_y, y)
                         has_moves = True
@@ -1014,6 +1177,10 @@ def _fix_z_startup_head(head: list[str], target: float, builder: GCodeBuilder) -
     relative = False
     for line in head:
         relative = _coord_relative(line, relative)
+        low = line.lower()
+        if "postprocess" not in low and PP_SKIRT not in low and PP_BRIM not in low:
+            fixed_head.append(line)
+            continue
         new_line, line_changed = _fix_z_line(line, target, builder, relative=relative)
         fixed_head.append(new_line)
         if line_changed:
@@ -1022,19 +1189,22 @@ def _fix_z_startup_head(head: list[str], target: float, builder: GCodeBuilder) -
 
 def generate_contour_skirt(profile: E5S1Profile, bbox: tuple[float, float, float, float] | None, builder: GCodeBuilder) -> list[str]:
     z_val = profile["first_layer_height_mm"]
-    lines = [builder.skirt_comment(), builder.skirt_z(z_val)]
+    lines = [builder.skirt_comment()]
 
     if bbox is not None:
         min_x, min_y, max_x, max_y = bbox
-        base_x0 = max(BED_X_MIN, min_x - SKIRT_OFFSET_MM)
-        base_y0 = max(BED_Y_MIN, min_y - SKIRT_OFFSET_MM)
-        base_x1 = min(BED_X_MAX, max_x + SKIRT_OFFSET_MM)
-        base_y1 = min(BED_Y_MAX, max_y + SKIRT_OFFSET_MM)
+        offset = _skirt_offset_mm(bbox)
+        base_x0 = max(BED_X_MIN, min_x - offset)
+        base_y0 = max(BED_Y_MIN, min_y - offset)
+        base_x1 = min(BED_X_MAX, max_x + offset)
+        base_y1 = min(BED_Y_MAX, max_y + offset)
     else:
         base_x0 = profile["skirt_origin_x_mm"]
         base_y0 = profile["skirt_origin_y_mm"]
         base_x1 = base_x0 + profile["skirt_side_mm"]
         base_y1 = base_y0 + profile["skirt_side_mm"]
+
+    lines.extend(_skirt_safe_approach(base_x0, base_y0, z_val))
 
     for loop in range(profile["skirt_loops"]):
         offset_mm = loop * profile["skirt_loop_offset_mm"]
@@ -1061,6 +1231,73 @@ def generate_contour_skirt(profile: E5S1Profile, bbox: tuple[float, float, float
             ]
         )
     lines.append(builder.skirt_reset_e())
+    return lines
+
+def _bbox_side_mm(bbox: tuple[float, float, float, float]) -> float:
+    min_x, min_y, max_x, max_y = bbox
+    return max(max_x - min_x, max_y - min_y)
+
+def _skirt_offset_mm(bbox: tuple[float, float, float, float] | None) -> float:
+    if bbox is not None and _bbox_side_mm(bbox) < BRIM_AUTO_BBOX_MM:
+        return SKIRT_OFFSET_SMALL_MM
+    return SKIRT_OFFSET_MM
+
+def _loop_radius_mm(perimeter_mm: float) -> float:
+    return perimeter_mm / (2 * math.pi)
+
+def _is_small_loop(perimeter_mm: float, closed: bool) -> bool:
+    if not closed or perimeter_mm <= 0:
+        return False
+    return perimeter_mm < SMALL_LOOP_PERIMETER_MAX_MM or _loop_radius_mm(perimeter_mm) < SMALL_LOOP_RADIUS_MM
+
+def _segment_cumulative_dist(region: list[str], seg: list[int]) -> list[tuple[int, float]]:
+    out: list[tuple[int, float]] = []
+    cum = 0.0
+    last_x, last_y = None, None
+    for idx in seg:
+        step, x, y = _motion_step_mm(region[idx], last_x, last_y)
+        if step > 0:
+            cum += step
+        out.append((idx, cum))
+        last_x, last_y = x, y
+    return out
+
+def generate_contour_brim(profile: E5S1Profile, bbox: tuple[float, float, float, float] | None, builder: GCodeBuilder) -> list[str]:
+    z_val = profile["first_layer_height_mm"]
+    lines = [builder.brim_comment()]
+    if bbox is None:
+        return lines
+    min_x, min_y, max_x, max_y = bbox
+    base_x0 = max(BED_X_MIN, min_x - BRIM_WIDTH_MM)
+    base_y0 = max(BED_Y_MIN, min_y - BRIM_WIDTH_MM)
+    base_x1 = min(BED_X_MAX, max_x + BRIM_WIDTH_MM)
+    base_y1 = min(BED_Y_MAX, max_y + BRIM_WIDTH_MM)
+    lines.extend(_skirt_safe_approach(base_x0, base_y0, z_val))
+    brim_loops = 0
+    for loop in range(BRIM_LOOPS):
+        offset_mm = loop * profile["skirt_loop_offset_mm"]
+        x0 = max(BED_X_MIN, base_x0 - offset_mm)
+        y0 = max(BED_Y_MIN, base_y0 - offset_mm)
+        x1 = min(BED_X_MAX, base_x1 + offset_mm)
+        y1 = min(BED_Y_MAX, base_y1 + offset_mm)
+        len_x, len_y = x1 - x0, y1 - y0
+        if len_x <= SKIRT_MIN_SIDE_MM or len_y <= SKIRT_MIN_SIDE_MM:
+            continue
+        segment_e_x = len_x * BRIM_EXTRUSION_MM_PER_MM
+        segment_e_y = len_y * BRIM_EXTRUSION_MM_PER_MM
+        lines.extend(
+            [
+                f"G1 X{x0} Y{y0} F{SKIRT_TRAVEL_F} ; {PP_BRIM}",
+                f"G1 X{x1} Y{y0} E{segment_e_x:.2f} F{SKIRT_EXTRUDE_F} ; {PP_BRIM}",
+                f"G1 X{x1} Y{y1} E{segment_e_y:.2f} F{SKIRT_EXTRUDE_F} ; {PP_BRIM}",
+                f"G1 X{x0} Y{y1} E{segment_e_x:.2f} F{SKIRT_EXTRUDE_F} ; {PP_BRIM}",
+                f"G1 X{x0} Y{y0} E{segment_e_y:.2f} F{SKIRT_EXTRUDE_F} ; {PP_BRIM}",
+            ]
+        )
+        brim_loops += 1
+    if brim_loops == 0:
+        return [builder.brim_comment()]
+    lines.append(f"G92 E0 ; {PP_BRIM}")
     return lines
 
 def _comment_prefix_len(lines: list[str]) -> int:
@@ -1102,11 +1339,9 @@ def _normalize_startup_order(head: list[str]) -> list[str]:
         "skirt": [],
         "other": [],
     }
-    in_skirt = False
     for line in motion:
         low = line.lower()
-        if PP_SKIRT in low or in_skirt:
-            in_skirt = in_skirt or PP_SKIRT in low
+        if PP_SKIRT in low or PP_BRIM in low or "postprocess safe z" in low or "postprocess travel" in low:
             buckets["skirt"].append(line)
             continue
         if M140_RE.match(line.strip()) or M190_RE.match(line.strip()):
@@ -1128,11 +1363,18 @@ def _normalize_startup_order(head: list[str]) -> list[str]:
         + buckets["mesh"]
         + buckets["heat"]
         + buckets["purge"]
-        + buckets["skirt"]
         + buckets["other"]
+        + buckets["skirt"]
     )
 
-def repair_startup(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> tuple[list[str], int]:
+def repair_startup(
+    lines: list[str],
+    profile: E5S1Profile,
+    builder: GCodeBuilder,
+    actions: list[str],
+    *,
+    needs_support: bool = False,
+) -> tuple[list[str], int]:
     h_idx = head_index(lines)
     head, tail = list(lines[:h_idx]), lines[h_idx:]
     changed = False
@@ -1145,6 +1387,16 @@ def repair_startup(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder
     if g28_idx is not None and "M420" not in head_join and "G29" not in head_join and "BED_MESH" not in head_join:
         _insert_after(head, g28_idx, builder.mesh_enable())
         actions.append("mesh_enabled")
+        changed = True
+    bed_temp: str | None = None
+    for line in head:
+        if m := M140_S_RE.match(line.strip()):
+            bed_temp = m.group(1)
+            break
+    if bed_temp and not M190_RE.search("\n".join(head)):
+        m140_idx = _line_index(head, M140_RE)
+        _insert_after(head, m140_idx, builder.wait_bed(bed_temp))
+        actions.append("m190_added")
         changed = True
     if not M109_RE.search("\n".join(head)):
         hotend_c = profile["first_layer_temperature_c"]
@@ -1170,21 +1422,51 @@ def repair_startup(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder
         actions.append("z_fix")
         changed = True
     has_skirt, has_brim = has_skirt_or_brim(lines)
-    if not has_skirt and not has_brim and not any(PP_SKIRT in line for line in lines):
-        skirt_block = generate_contour_skirt(profile, scan_bounding_box(tail), builder)
-        if _head_relative_mode(head):
-            skirt_block = [builder.absolute_mode(), *skirt_block]
-            actions.append("g90_before_skirt")
-        head = _insert_skirt_block(head, skirt_block)
-        actions.append(f"skirt_added×{profile['skirt_loops']}")
-        changed = True
+    bbox = scan_bounding_box(tail)
+    small_part = bbox is not None and _bbox_side_mm(bbox) < BRIM_AUTO_BBOX_MM
     normalized_head = _normalize_startup_order(head)
     if normalized_head != head:
         actions.append("startup_order")
         head = normalized_head
         changed = True
+    insert_at = head_index(head)
+    if (needs_support or small_part) and not has_brim and not any(PP_BRIM in line for line in lines):
+        brim_block = generate_contour_brim(profile, bbox, builder)
+        if len(brim_block) > 1:
+            if _head_relative_mode(head):
+                brim_block = [builder.absolute_mode(), *brim_block]
+                actions.append("g90_before_brim")
+            head = head[:insert_at] + brim_block + head[insert_at:]
+            actions.append(f"brim_added×{BRIM_LOOPS}")
+            changed = True
+            insert_at += len(brim_block)
+    if not has_skirt and not has_brim and not any(PP_SKIRT in line for line in lines):
+        skirt_block = generate_contour_skirt(profile, bbox, builder)
+        if _head_relative_mode(head):
+            skirt_block = [builder.absolute_mode(), *skirt_block]
+            actions.append("g90_before_skirt")
+        head = head[:insert_at] + skirt_block + head[insert_at:]
+        actions.append(f"skirt_added×{profile['skirt_loops']}")
+        changed = True
     result = head + tail if changed else lines
     return result, len(head)
+
+def _segment_closed(region: list[str], seg: list[int]) -> bool:
+    sx = sy = lx = ly = None
+    for idx in seg:
+        upper = region[idx].upper()
+        if not upper.startswith(("G0", "G1", "G2", "G3")):
+            continue
+        m_x, m_y = X_VAL_RE.search(upper), Y_VAL_RE.search(upper)
+        x, y = _axis_float(m_x), _axis_float(m_y)
+        if x is None or y is None:
+            continue
+        if sx is None:
+            sx, sy = x, y
+        lx, ly = x, y
+    if sx is None or lx is None:
+        return False
+    return math.hypot(lx - sx, ly - sy) <= LOOP_CLOSE_TOL_MM
 
 def repair_small_perimeters(
     lines: list[str],
@@ -1196,68 +1478,199 @@ def repair_small_perimeters(
 ) -> list[str]:
     start = body_start if body_start is not None else head_index(lines)
     region = lines[start:]
-    segments: list[tuple[list[int], float]] = []
+    segments: list[tuple[list[int], float, int, bool]] = []
     in_perimeter = False
     curr_seg: list[int] = []
     curr_dist = 0.0
     last_x, last_y = None, None
+    layer_num = 0
 
     for i, line in enumerate(region):
+        if any(m in line for m in LAYER_MARKERS):
+            layer_num += 1
         feat = type_feature(line)
         if feat in FEAT_PERIMETER:
             if curr_seg:
-                segments.append((curr_seg, curr_dist))
+                segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg)))
             in_perimeter = True
             curr_seg = []
             curr_dist = 0.0
         elif feat is not None:
             in_perimeter = False
             if curr_seg:
-                segments.append((curr_seg, curr_dist))
+                segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg)))
                 curr_seg = []
 
         upper = line.upper()
         if upper.startswith(("G0", "G1", "G2", "G3")):
-            m_x = X_VAL_RE.search(upper)
-            m_y = Y_VAL_RE.search(upper)
             m_e = E_VAL_RE.search(upper)
-
-            x = _axis_float(m_x) if m_x else last_x
-            y = _axis_float(m_y) if m_y else last_y
             e_val = m_e.group(1) if m_e else None
             is_extrude = bool(e_val is not None and not e_val.startswith("-") and e_val != "0")
+            step, x, y = _motion_step_mm(line, last_x, last_y)
 
             if in_perimeter and is_extrude:
                 if not curr_seg:
                     curr_dist = 0.0
-                elif last_x is not None and last_y is not None and x is not None and y is not None:
-                    curr_dist += math.hypot(x - last_x, y - last_y)
+                elif step > 0:
+                    curr_dist += step
                 curr_seg.append(i)
             elif curr_seg:
-                segments.append((curr_seg, curr_dist))
+                segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg)))
                 curr_seg = []
 
             last_x, last_y = x, y
 
     if curr_seg:
-        segments.append((curr_seg, curr_dist))
+        segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg)))
 
-    small_segments = [seg for seg, dist in segments if 0 < dist < SMALL_PERIMETER_THRESHOLD_MM]
+    small_segments = [s for s in segments if 0 < s[1] < SMALL_PERIMETER_THRESHOLD_MM]
     if not small_segments:
         return lines
 
-    boost = builder.flow_boost(SMALL_PERIMETER_FLOW_BOOST_PCT, "small perimeter flow boost")
-    reset = builder.flow_reset()
-    out = list(region)
-    for seg in sorted(small_segments, key=lambda s: s[0], reverse=True):
+    inject_before: dict[int, list[str]] = {}
+    inject_after: dict[int, list[str]] = {}
+    overrides: dict[int, str] = {}
+    join_f = profile["seam_join_f"]
+
+    for seg, dist, layer_at, closed in small_segments:
         i0, i1 = seg[0], seg[-1]
-        capped, _, _ = cap_f_line(out[i0], SMALL_PERIMETER_SPEED_CAP_F, SMALL_PERIMETER_SPEED_CAP_F, builder)
-        out[i0] = capped + " ; postprocess small perimeter speed cap"
-        out.insert(i1 + 1, reset)
-        out.insert(i0, boost)
+        small_loop = _is_small_loop(dist, closed)
+        cum = _segment_cumulative_dist(region, seg)
+
+        if small_loop:
+            start_pct = SMALL_LOOP_START_BOOST_PCT
+            inject_before.setdefault(i0, []).append(builder.flow_boost(start_pct, "small loop start"))
+            boost_end = i0
+            for idx, d in cum:
+                if d <= SMALL_LOOP_START_BOOST_MM:
+                    boost_end = idx
+                else:
+                    break
+            if boost_end != i1:
+                inject_after.setdefault(boost_end, []).append(builder.flow_reset())
+            else:
+                inject_after.setdefault(i1, []).append(builder.flow_reset())
+            for idx, d in cum:
+                if dist - d <= SMALL_LOOP_CLOSE_MM:
+                    overrides[idx] = cap_f_line(region[idx], join_f, join_f, builder)[0] + " ; postprocess loop close cap"
+            if dist < SMALL_LOOP_FAN_OFF_MAX_MM and layer_at <= SMALL_LOOP_FAN_OFF_LAYERS:
+                inject_before.setdefault(i0, []).insert(0, "M106 S0 ; postprocess small loop fan hold")
+                layer_pwm = fan_pwm_for_layer(layer_at, profile)
+                if layer_pwm is not None:
+                    inject_after.setdefault(i1, []).append(builder.fan_restore(layer_pwm))
+        else:
+            inject_before.setdefault(i0, []).append(builder.flow_boost(SMALL_PERIMETER_FLOW_BOOST_PCT, "small perimeter flow boost"))
+            inject_after.setdefault(i0, []).append(builder.flow_reset())
+            capped, _, _ = cap_f_line(region[i0], SMALL_PERIMETER_SPEED_CAP_F, SMALL_PERIMETER_SPEED_CAP_F, builder)
+            overrides[i0] = capped + " ; postprocess small perimeter speed cap"
+            if dist < SMALL_LOOP_CLOSE_MM:
+                overrides[i1] = cap_f_line(region[i1], join_f, join_f, builder)[0] + " ; postprocess loop close cap"
+            if dist < SMALL_LOOP_FAN_OFF_MAX_MM and layer_at <= SMALL_LOOP_FAN_OFF_LAYERS:
+                inject_before.setdefault(i0, []).insert(0, "M106 S0 ; postprocess small loop fan hold")
+                layer_pwm = fan_pwm_for_layer(layer_at, profile)
+                if layer_pwm is not None:
+                    inject_after.setdefault(i1, []).append(builder.fan_restore(layer_pwm))
+
+    out = list(region)
+    for idx in sorted(overrides, reverse=True):
+        out[idx] = overrides[idx]
+    for idx in sorted(inject_after, reverse=True):
+        for ln in reversed(inject_after[idx]):
+            out.insert(idx + 1, ln)
+    for idx in sorted(inject_before, reverse=True):
+        for ln in reversed(inject_before[idx]):
+            out.insert(idx, ln)
 
     actions.append(f"small_perimeters_fixed×{len(small_segments)}")
     return lines[:start] + out
+
+def repair_coast(lines: list[str], actions: list[str]) -> list[str]:
+    out = list(lines)
+    coasted = 0
+    for i in range(len(out) - 1, 0, -1):
+        if "postprocess layer retract" not in out[i].lower():
+            continue
+        for j in range(i - 1, max(i - 24, -1), -1):
+            stripped = out[j].strip()
+            if not G1_EXTRUDE_RE.match(stripped):
+                continue
+            if "postprocess coast" in out[j]:
+                break
+            new_line = _coast_e_on_line(out[j], COAST_E_MM)
+            if new_line:
+                out[j] = new_line + " ; postprocess coast"
+                coasted += 1
+            break
+    if coasted:
+        actions.append(f"coast×{coasted}")
+    return out
+
+def repair_travel_coast(lines: list[str], actions: list[str]) -> list[str]:
+    out = list(lines)
+    body_start = _coast_travel_body_start(out)
+    last_x, last_y = None, None
+    last_ext_i: int | None = None
+    coasted = 0
+    for i in range(body_start, len(out)):
+        line = out[i]
+        if any(m in line for m in LAYER_MARKERS):
+            last_ext_i = None
+            continue
+        upper = line.strip().upper()
+        if not upper.startswith(("G0", "G1", "G2", "G3")):
+            continue
+        low = line.lower()
+        if "postprocess purge" in low or PP_SKIRT in low or PP_BRIM in low:
+            continue
+        m_e = E_VAL_RE.search(upper)
+        e_val = float(m_e.group(1)) if m_e else 0.0
+        is_extrude = e_val > COAST_MIN_REMAIN_E_MM
+        step, x, y = _motion_step_mm(line, last_x, last_y)
+        if is_extrude:
+            last_ext_i = i
+        elif step >= TRAVEL_COAST_MIN_MM and last_ext_i is not None and "postprocess coast" not in out[last_ext_i]:
+            if i - last_ext_i <= COAST_LAYER_GUARD_LINES:
+                continue
+            new_line = _coast_e_on_line(out[last_ext_i], COAST_E_MM)
+            if new_line:
+                out[last_ext_i] = new_line + " ; postprocess coast travel"
+                coasted += 1
+                last_ext_i = None
+        if x is not None:
+            last_x = x
+        if y is not None:
+            last_y = y
+    if coasted:
+        actions.append(f"coast_travel×{coasted}")
+    return out
+
+def repair_deretract(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
+    out = list(lines)
+    slowed = 0
+    i = 0
+    while i < len(out):
+        low = out[i].lower()
+        if "postprocess" in low and "e-" in low and RETRACT_RE.match(out[i].strip()):
+            for j in range(i + 1, min(i + 16, len(out))):
+                stripped = out[j].strip()
+                if not G1_EXTRUDE_RE.match(stripped):
+                    continue
+                m = E_VAL_RE.search(stripped)
+                if not m:
+                    break
+                e_val = float(m.group(1))
+                if e_val <= 0:
+                    break
+                if e_val <= DERETRACT_MAX_E_MM and "deretract" not in out[j]:
+                    new_line, capped, _ = cap_f_line(out[j], DERETRACT_F, profile["retract_f"], builder)
+                    if capped or DERETRACT_F < profile["retract_f"]:
+                        out[j] = new_line + " ; postprocess deretract slow"
+                        slowed += 1
+                break
+        i += 1
+    if slowed:
+        actions.append(f"deretract_slow×{slowed}")
+    return out
 
 def repair_layer_marker(
     lines: list[str],
@@ -1331,10 +1744,12 @@ class TransformContext:
         layer_h: float | None = None,
         *,
         uses_before_after_markers: bool = True,
+        max_part_cooling: bool = False,
     ):
         self.profile = profile
         self.builder = builder
         self.skip_overhang_fan = skip_overhang_fan
+        self.max_part_cooling = max_part_cooling
         self.uses_before_after_markers = uses_before_after_markers
         self.layer_h = layer_h or LAYER_HEIGHT_FIRST_MM
         self.out: list[str] = []
@@ -1350,6 +1765,8 @@ class TransformContext:
         self.pending_surface_clear = False
         self.last_f = profile["default_motion_f"]
         self.last_pa_k: float | None = None
+        self.last_x: float | None = None
+        self.last_y: float | None = None
         self.skip_fan_at: set[int] = set()
         self.current_line = ""
         self.current_upper = ""
@@ -1392,6 +1809,8 @@ class TransformContext:
     def begin_layer(self, stripped: str) -> None:
         self.layer_count += 1
         cap = fan_pwm_for_layer(self.layer_count, self.profile)
+        if self.max_part_cooling and self.layer_count > self.profile["fan_off_layers"]:
+            cap = self.profile["max_fan_pwm"]
         self.out.append(stripped)
         ramp = self.profile["flow_ramp"]
         if self.layer_count <= len(ramp):
@@ -1413,8 +1832,14 @@ class TransformContext:
         self.layer_fan_cap = cap
 
 def transform_speed_tracking(ctx: TransformContext, lines: list[str], idx: int) -> bool:
-    if ctx.current_upper.startswith(("G0", "G1", "G2", "G3")) and (fm := F_RE.search(ctx.current_line)):
-        ctx.last_f = int(fm.group(1))
+    if ctx.current_upper.startswith(("G0", "G1", "G2", "G3")):
+        if fm := F_RE.search(ctx.current_line):
+            ctx.last_f = int(fm.group(1))
+        m_x, m_y = X_VAL_RE.search(ctx.current_upper), Y_VAL_RE.search(ctx.current_upper)
+        if m_x:
+            ctx.last_x = _axis_float(m_x)
+        if m_y:
+            ctx.last_y = _axis_float(m_y)
     return False
 
 def transform_startup_line(ctx: TransformContext, lines: list[str], idx: int) -> bool:
@@ -1450,9 +1875,10 @@ def transform_feature_type(ctx: TransformContext, lines: list[str], idx: int) ->
             ctx.flow_bridge = True
             ctx.out.append(ctx.builder.fan_command("bridge", ctx.profile["bridge_fan_pwm"]))
             ctx.actions.append("fan_bridge")
-        elif not ctx.skip_overhang_fan:
-            ctx.out.append(ctx.builder.fan_command("overhang", ctx.profile["overhang_fan_pwm"]))
-            ctx.actions.append("fan_overhang")
+        elif not ctx.skip_overhang_fan or ctx.max_part_cooling:
+            pwm = ctx.profile["max_fan_pwm"] if ctx.max_part_cooling else ctx.profile["overhang_fan_pwm"]
+            ctx.out.append(ctx.builder.fan_command("overhang", pwm))
+            ctx.actions.append("fan_overhang" if not ctx.max_part_cooling else "fan_max_cooling")
         ctx.apply_pa(feat)
         ctx.boost_fan = True
         ctx.cool_boost = True
@@ -1476,7 +1902,8 @@ def transform_feature_type(ctx: TransformContext, lines: list[str], idx: int) ->
                 ctx.seam_flow = True
                 ctx.actions.append(f"flow_seam_S{ctx.profile['seam_flow_pct']}")
             skip_idx = tune_fan_speed(
-                ctx.out, ctx.actions, feat, lines, idx, ctx.layer_count, ctx.layer_fan_cap, ctx.profile, ctx.builder
+                ctx.out, ctx.actions, feat, lines, idx, ctx.layer_count, ctx.layer_fan_cap, ctx.profile, ctx.builder,
+                max_part_cooling=ctx.max_part_cooling,
             )
             if skip_idx:
                 ctx.skip_fan_at.add(skip_idx)
@@ -1514,11 +1941,14 @@ def transform_layer_boundary(ctx: TransformContext, lines: list[str], idx: int) 
             ctx.restore_layer_fan()
         ctx.reset_flow()
         if LAYER_BEFORE_MARKER in ctx.current_line and LAYER_RETRACT and ctx.layer_count >= 1 and not recent_retract(ctx.out):
-            seam_extra = ctx.surface_kind in FEAT_SEAM
-            ctx.out.extend(layer_retract_lines(ctx.profile, ctx.builder, seam_extra=seam_extra))
-            ctx.actions.append("retract_layer")
-            if seam_extra and ctx.profile["seam_extra_retract"] > 0:
-                ctx.actions.append("seam_extra_retract")
+            if not _slicer_layer_prep_before(lines, idx):
+                seam_extra = ctx.surface_kind in FEAT_SEAM
+                ctx.out.extend(layer_retract_lines(
+                    ctx.profile, ctx.builder, seam_extra=seam_extra, last_x=ctx.last_x, last_y=ctx.last_y,
+                ))
+                ctx.actions.append("retract_layer")
+                if seam_extra and ctx.profile["seam_extra_retract"] > 0:
+                    ctx.actions.append("seam_extra_retract")
         ctx.boost_fan = False
         ctx.cool_boost = False
         ctx.pending_surface_clear = True
@@ -1594,6 +2024,23 @@ def transform_speed_cap(ctx: TransformContext, lines: list[str], idx: int) -> bo
             return True
     return False
 
+def transform_travel_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool:
+    fan_m = FAN_ON_RE.match(ctx.current_line)
+    if (
+        ctx.current_upper.startswith(("G0", "G1", "G2", "G3"))
+        and not G1_EXTRUDE_RE.match(ctx.current_line)
+        and not fan_m
+        and " Z" not in ctx.current_upper
+    ):
+        cap = ctx.profile["default_motion_f"]
+        new_line, capped, last_f = cap_f_line(ctx.current_line, cap, ctx.last_f, ctx.builder)
+        ctx.out.append(new_line)
+        ctx.last_f = last_f
+        if capped:
+            ctx.actions.append("cap_travel")
+        return True
+    return False
+
 def transform_gcode(
     lines: list[str],
     *,
@@ -1607,11 +2054,7 @@ def transform_gcode(
     cfg = prusa_cfg if prusa_cfg is not None else {}
 
     body_idx = head_index(lines)
-    uses_before_after = any(
-        marker in line
-        for line in lines[:body_idx]
-        for marker in LAYER_START_MARKERS
-    )
+    uses_before_after = uses_before_after_markers(lines)
 
     builder = GCodeBuilder(pa_fw)
     ctx = TransformContext(
@@ -1620,6 +2063,7 @@ def transform_gcode(
         skip_overhang_fan,
         analysis["layer_h"],
         uses_before_after_markers=uses_before_after,
+        max_part_cooling=need_sup,
     )
 
     transformers = [
@@ -1632,6 +2076,7 @@ def transform_gcode(
         transform_accel_cap,
         transform_fan_cap,
         transform_speed_cap,
+        transform_travel_cap,
     ]
 
     for i, line in enumerate(lines):
@@ -1650,8 +2095,11 @@ def transform_gcode(
 
     repair_actions: list[str] = []
     out = ctx.out
-    out, body_start = repair_startup(out, profile, builder, repair_actions)
+    out, body_start = repair_startup(out, profile, builder, repair_actions, needs_support=need_sup)
     out = repair_small_perimeters(out, profile, builder, repair_actions, body_start=body_start)
+    out = repair_coast(out, repair_actions)
+    out = repair_travel_coast(out, repair_actions)
+    out = repair_deretract(out, profile, builder, repair_actions)
     out = repair_layer_marker(out, builder, repair_actions, cfg)
     ctx.actions.extend(repair_actions)
     out = strip_pp_lines(out)
@@ -1661,7 +2109,7 @@ def transform_gcode(
     if skip_overhang_fan:
         ctx.actions.append(f"fan_overhang_skip×{analysis['overhang_markers']}")
     elif need_sup:
-        ctx.actions.append("support_cooling")
+        ctx.actions.append("max_part_cooling")
     return out, ctx.actions
 
 def _export_search_dirs() -> tuple[Path, ...]:
@@ -1868,7 +2316,7 @@ class PostProcessApp:
             except OSError as e:
                 self.logger.log_state_warn(str(e), quiet)
 
-            result_analysis = self.analyzer.analyze(result, hint, prusa_cfg=prusa_cfg)
+            result_analysis = analysis_after_transform(analysis, result, prusa_cfg)
             errors, warnings = self.validator.validate(result, expect_postprocess=True, analysis=result_analysis)
             try:
                 state_data = {
