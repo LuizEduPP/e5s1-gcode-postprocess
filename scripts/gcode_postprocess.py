@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""E5S1 G-code post-processor — constants, profile, transform pipeline, and CLI."""
+"""G-code post-processor — E5S1 / E3 Pro presets, transform pipeline, and CLI."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Any, NamedTuple, TypedDict
 import heapq
 import json
 import math
@@ -13,8 +14,29 @@ import re
 import sys
 import time
 
-PROJECT = Path(__file__).resolve().parent.parent
-LOG_DIR = PROJECT / "logs"
+_SCRIPT_PATH = Path(__file__).resolve()
+SCRIPT_DIR = _SCRIPT_PATH.parent
+ENV_GCODE_LOG_DIR = "GCODE_POSTPROCESS_LOG_DIR"
+
+
+def _resolve_project_root() -> Path:
+    """Repo root when script lives in scripts/; otherwise the folder containing the script."""
+    if SCRIPT_DIR.name == "scripts":
+        repo_root = SCRIPT_DIR.parent
+        if (repo_root / "scripts" / _SCRIPT_PATH.name).resolve() == _SCRIPT_PATH:
+            return repo_root
+    return SCRIPT_DIR
+
+
+def _resolve_log_dir(project_root: Path) -> Path:
+    override = os.environ.get(ENV_GCODE_LOG_DIR, "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return project_root / "logs"
+
+
+PROJECT = _resolve_project_root()
+LOG_DIR = _resolve_log_dir(PROJECT)
 STATE_FILE = LOG_DIR / "e5s1_state.json"
 LOG_FILE = LOG_DIR / "e5s1_events.log"
 
@@ -25,16 +47,13 @@ LAYER_CHANGE_MARKER = ";LAYER_CHANGE"
 AFTER_LAYER_MARKER = ";AFTER_LAYER_CHANGE"
 LAYER_N_MARKER = ";LAYER:"
 LAYER_MARKERS = (LAYER_BEFORE_MARKER, LAYER_CHANGE_MARKER, AFTER_LAYER_MARKER)
-LAYER_START_MARKERS = (LAYER_BEFORE_MARKER, AFTER_LAYER_MARKER)
 
-FEAT_SEAM = frozenset({"external", "perimeter"})
+FEAT_PERIMETER = frozenset({"external", "perimeter"})
 FEAT_FAN_TUNE = frozenset({"external", "perimeter", "top", "ironing", "interface", "support", "bottom", "brim"})
 FEAT_FAN_BOOST = frozenset({"top", "ironing", "interface", "support", "bottom", "external", "perimeter", "brim", "bridge", "overhang"})
 FEAT_COOL = frozenset({"bridge", "overhang"})
 FEAT_WALL = frozenset({"external", "perimeter", "gap_fill", "brim"})
-FEAT_WALL_CAP = frozenset({"external", "perimeter", "gap_fill"})
 FEAT_INFILL = frozenset({"internal", "solid", "support"})
-FEAT_PERIMETER = frozenset({"external", "perimeter"})
 
 AXIS_NUM = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
 
@@ -108,7 +127,6 @@ SKIRT_OFFSET_SMALL_MM = 2.5
 SKIRT_MIN_SIDE_MM = 0.1
 STARTUP_SAFE_Z_MM = 10.0
 COAST_MIN_REMAIN_E_MM = 0.02
-COAST_LAYER_GUARD_LINES = 8
 
 PEEK_SLICER_FAN_WINDOW = 24
 PEEK_FAN_GRACE_MOTION = 2
@@ -130,7 +148,8 @@ FIRST_LAYER_SMALL_OPEN_MAX_MM = 30.0
 FIRST_LAYER_SMALL_OPEN_SPEED_MM_S = 14.0
 FIRST_LAYER_REPAIR_MAX_LAYER = 1
 LOOP_CLOSE_TOL_MM = 0.05
-SEAM_JOIN_FLOW_MM = 1.5
+SEAM_JOIN_FLOW_MM = 1.0
+SEAM_JOIN_FLOW_SMALL_MM = 2.5
 
 SKIRT_OFFSET_SMALL_BBOX_MM = 45.0
 
@@ -159,6 +178,7 @@ FLOW_NORMAL_PCT = 100
 MM_S_TO_F = 60
 
 NOZZLE_DIAMETER_MM = 0.8
+LOOP_NEAR_CLOSE_TOL_MM = NOZZLE_DIAMETER_MM * 0.15 + LOOP_CLOSE_TOL_MM
 LAYER_HEIGHT_FIRST_MM = 0.24
 TEMP_FIRST_LAYER_C = "215"
 MAX_VOLUMETRIC_FLOW_MM3_S = 30.0
@@ -179,7 +199,7 @@ FAN_IRONING_PCT = 35
 FAN_INTERFACE_PCT = 78
 FAN_SUPPORT_PCT = 78
 
-FLOW_RAMP = (100, 97, 98, 100)
+FLOW_RAMP = (100, 100, 98, 100)
 FLOW_BRIDGE_PCT = 95
 NOZZLE_EXTERNAL_MM_S = 52
 NOZZLE_WALL_MM_S = 62
@@ -195,9 +215,18 @@ LAYER_CAP_EXTRUSION = 1
 LAYER_FIRST_MOTION = 3
 
 SEAM_EXTRA_RETRACT_MM = 0.4
-SEAM_FLOW_PCT = 96
+SEAM_FLOW_PCT = 100
+SEAM_FLOW_SMALL_PCT = 105
+SEAM_JOIN_E_BOOST_RATIO = 1.04
 SEAM_FAN_PCT = 85
-SEAM_JOIN_SPEED_MM_S = 20.0
+SEAM_JOIN_SPEED_MM_S = 18.0
+EXTRA_DERETRACT_RESTART_MM = 0.08
+EXTRA_DERETRACT_TINY_MM = 0.10
+FIRST_LAYER_EXTRA_RESTART_MM = 0.12
+FIRST_LAYER_EXTRA_TINY_MM = 0.14
+FIRST_LAYER_SEAM_JOIN_E_BOOST_RATIO = 1.07
+FIRST_LAYER_SEAM_FLOW_SMALL_PCT = 108
+EXTRA_DERETRACT_LOOKBACK = 48
 
 SKIRT_LOOPS = 3
 SKIRT_SIDE_MM = 40.0
@@ -218,12 +247,225 @@ PURGE_NOZZLE_MULT = 1.25
 PURGE_E_DIVISOR = 2.405
 PURGE_E_SECOND_MULT = 2.0
 
-Z_HOP_F = 600
-SKIRT_Z_F = 600
+Z_MOVE_F = 600
 SKIRT_TRAVEL_F = 6000
 SKIRT_EXTRUDE_F = 600
 
+ENV_GCODE_PRINTER = "GCODE_PRINTER"
 ENV_E5S1_EXPORT_DIR = "E5S1_EXPORT_DIR"
+
+TUNE_CONSTANT_NAMES: tuple[str, ...] = (
+    "BED_X_MIN",
+    "BED_X_MAX",
+    "BED_Y_MIN",
+    "BED_Y_MAX",
+    "SKIRT_OFFSET_MM",
+    "SKIRT_OFFSET_SMALL_MM",
+    "SKIRT_MIN_SIDE_MM",
+    "STARTUP_SAFE_Z_MM",
+    "SMALL_LOOP_TINY_MAX_MM",
+    "SMALL_LOOP_TINY_SPEED_MM_S",
+    "SMALL_LOOP_SMALL_MAX_MM",
+    "SMALL_LOOP_SMALL_SPEED_MM_S",
+    "SMALL_OPEN_MAX_MM",
+    "SMALL_OPEN_SPEED_MM_S",
+    "FIRST_LAYER_LOOP_MAX_MM",
+    "FIRST_LAYER_LOOP_TINY_MAX_MM",
+    "FIRST_LAYER_LOOP_TINY_SPEED_MM_S",
+    "FIRST_LAYER_LOOP_SPEED_MM_S",
+    "FIRST_LAYER_SMALL_OPEN_MAX_MM",
+    "FIRST_LAYER_SMALL_OPEN_SPEED_MM_S",
+    "FIRST_LAYER_REPAIR_MAX_LAYER",
+    "SEAM_JOIN_FLOW_MM",
+    "SEAM_JOIN_FLOW_SMALL_MM",
+    "SKIRT_OFFSET_SMALL_BBOX_MM",
+    "COAST_E_MM",
+    "LAYER_RETRACT_WIPE_MM",
+    "LAYER_RETRACT_WIPE_E_MM",
+    "TRAVEL_COAST_MIN_MM",
+    "TRAVEL_RETRACT_MM",
+    "TRAVEL_START_BOOST_PCT",
+    "TRAVEL_START_BOOST_MM",
+    "DERETRACT_F",
+    "DERETRACT_MAX_E_MM",
+    "SLICER_DERETRACT_MAX_E_MM",
+    "FIRST_LAYER_INTERNAL_WALL_FACTOR",
+    "FIRST_LAYER_INFILL_FACTOR",
+    "PA_K",
+    "NOZZLE_DIAMETER_MM",
+    "LAYER_HEIGHT_FIRST_MM",
+    "TEMP_FIRST_LAYER_C",
+    "MAX_VOLUMETRIC_FLOW_MM3_S",
+    "RETRACT_LENGTH_MM",
+    "RETRACT_SPEED_MM_S",
+    "RETRACT_LIFT_MM",
+    "FAN_OFF_LAYERS",
+    "FAN_RAMP_LAYERS",
+    "FAN_MIN_PCT",
+    "FAN_MAX_PCT",
+    "FAN_BRIDGE_PCT",
+    "FAN_OVERHANG_PCT",
+    "FAN_TOP_PCT",
+    "FAN_IRONING_PCT",
+    "FAN_INTERFACE_PCT",
+    "FAN_SUPPORT_PCT",
+    "FLOW_RAMP",
+    "FLOW_BRIDGE_PCT",
+    "NOZZLE_EXTERNAL_MM_S",
+    "NOZZLE_WALL_MM_S",
+    "NOZZLE_INFILL_MM_S",
+    "NOZZLE_CAP_MM_S",
+    "NOZZLE_TRAVEL_MM_S",
+    "SPEED_FIRST_LAYER_MM_S",
+    "SPEED_MAX_PRINT_MM_S",
+    "ACCEL_FIRST_LAYER",
+    "ACCEL_DEFAULT",
+    "LAYER_CAP_EXTRUSION",
+    "LAYER_FIRST_MOTION",
+    "SEAM_EXTRA_RETRACT_MM",
+    "SEAM_FLOW_PCT",
+    "SEAM_FLOW_SMALL_PCT",
+    "SEAM_JOIN_E_BOOST_RATIO",
+    "SEAM_FAN_PCT",
+    "SEAM_JOIN_SPEED_MM_S",
+    "EXTRA_DERETRACT_RESTART_MM",
+    "EXTRA_DERETRACT_TINY_MM",
+    "FIRST_LAYER_EXTRA_RESTART_MM",
+    "FIRST_LAYER_EXTRA_TINY_MM",
+    "FIRST_LAYER_SEAM_JOIN_E_BOOST_RATIO",
+    "FIRST_LAYER_SEAM_FLOW_SMALL_PCT",
+    "SKIRT_LOOPS",
+    "SKIRT_SIDE_MM",
+    "SKIRT_ORIGIN_X_MM",
+    "SKIRT_ORIGIN_Y_MM",
+    "SKIRT_LOOP_OFFSET_MM",
+    "SKIRT_EXTRUSION_MM_PER_MM",
+    "PURGE_X_START",
+    "PURGE_X_SECOND",
+    "PURGE_Y_START",
+    "PURGE_Y_END",
+    "PURGE_TRAVEL_F",
+    "PURGE_Z_F",
+    "PURGE_EXTRUDE_F",
+    "PURGE_E_FACTOR",
+    "PURGE_NOZZLE_MULT",
+    "PURGE_E_DIVISOR",
+    "PURGE_E_SECOND_MULT",
+)
+
+
+@dataclass(frozen=True)
+class PrinterPreset:
+    printer_id: str
+    marker: str
+    overrides: dict[str, Any]
+
+
+E3PRO_08_OVERRIDES: dict[str, Any] = {
+    "RETRACT_LENGTH_MM": 5.0,
+    "RETRACT_SPEED_MM_S": 45.0,
+    "RETRACT_LIFT_MM": 0.2,
+    "PA_K": 0.055,
+    "MAX_VOLUMETRIC_FLOW_MM3_S": 14.0,
+    "SLICER_DERETRACT_MAX_E_MM": 5.5,
+    "DERETRACT_MAX_E_MM": 0.45,
+    "TRAVEL_RETRACT_MM": 1.2,
+    "COAST_E_MM": 0.40,
+    "NOZZLE_EXTERNAL_MM_S": 32.0,
+    "NOZZLE_WALL_MM_S": 38.0,
+    "NOZZLE_INFILL_MM_S": 55.0,
+    "NOZZLE_CAP_MM_S": 28.0,
+    "NOZZLE_TRAVEL_MM_S": 120.0,
+    "SPEED_FIRST_LAYER_MM_S": 18.0,
+    "SPEED_MAX_PRINT_MM_S": 120.0,
+    "ACCEL_FIRST_LAYER": 500,
+    "ACCEL_DEFAULT": 1200,
+    "FAN_MIN_PCT": 90,
+    "SMALL_LOOP_TINY_SPEED_MM_S": 16.0,
+    "SMALL_LOOP_SMALL_SPEED_MM_S": 20.0,
+    "FIRST_LAYER_LOOP_TINY_SPEED_MM_S": 12.0,
+    "FIRST_LAYER_LOOP_SPEED_MM_S": 14.0,
+    "SEAM_JOIN_SPEED_MM_S": 15.0,
+    "SEAM_EXTRA_RETRACT_MM": 0.6,
+    "EXTRA_DERETRACT_RESTART_MM": 0.10,
+    "EXTRA_DERETRACT_TINY_MM": 0.12,
+    "FIRST_LAYER_EXTRA_RESTART_MM": 0.14,
+    "FIRST_LAYER_EXTRA_TINY_MM": 0.16,
+    "TEMP_FIRST_LAYER_C": "210",
+    "PURGE_Y_END": 175.0,
+}
+
+PRINTER_PRESETS: dict[str, PrinterPreset] = {
+    "e5s1": PrinterPreset("e5s1", "; --- E5S1 postprocess ---", {}),
+    "e3pro": PrinterPreset("e3pro", "; --- E3PRO postprocess ---", E3PRO_08_OVERRIDES),
+}
+
+ALL_POSTPROCESS_MARKERS: tuple[str, ...] = tuple(
+    dict.fromkeys(p.marker for p in PRINTER_PRESETS.values())
+)
+
+_PRINTER_ALIASES: dict[str, str] = {
+    "e5s1": "e5s1",
+    "ender5s1": "e5s1",
+    "e3pro": "e3pro",
+    "ender3pro": "e3pro",
+    "e3pro08": "e3pro",
+}
+
+_MODULE_DEFAULTS: dict[str, Any] = {name: globals()[name] for name in TUNE_CONSTANT_NAMES}
+_MODULE_DEFAULT_MARKER = MARKER
+_ACTIVE_PRINTER_ID = "e5s1"
+
+
+def _recompute_derived_constants() -> None:
+    global FAN_FULL_LAYER, LOOP_NEAR_CLOSE_TOL_MM, MARKER_HEAD_BYTES
+    FAN_FULL_LAYER = FAN_OFF_LAYERS + FAN_RAMP_LAYERS + 1
+    LOOP_NEAR_CLOSE_TOL_MM = NOZZLE_DIAMETER_MM * 0.15 + LOOP_CLOSE_TOL_MM
+    MARKER_HEAD_BYTES = max(MARKER_HEAD_MIN_BYTES, len(MARKER) + 64)
+
+
+def _normalize_printer_id(raw: str) -> str:
+    key = raw.strip().lower().replace("_", "").replace("-", "")
+    if key in PRINTER_PRESETS:
+        return key
+    for alias, printer_id in _PRINTER_ALIASES.items():
+        if key == alias.replace("_", "").replace("-", ""):
+            return printer_id
+    known = ", ".join(sorted(PRINTER_PRESETS))
+    raise ValueError(f"unknown printer {raw!r}; choose from {known}")
+
+
+def resolve_printer_id(argv: list[str] | None = None) -> str:
+    if argv:
+        for i, arg in enumerate(argv):
+            if arg in ("--printer", "-p") and i + 1 < len(argv):
+                return _normalize_printer_id(argv[i + 1])
+            if arg.startswith("--printer="):
+                return _normalize_printer_id(arg.split("=", 1)[1])
+    env = os.environ.get(ENV_GCODE_PRINTER, "").strip()
+    if env:
+        return _normalize_printer_id(env)
+    return "e5s1"
+
+
+def activate_printer(printer_id: str) -> str:
+    """Apply printer preset overrides to module-level tuning constants."""
+    global MARKER, _ACTIVE_PRINTER_ID
+    pid = _normalize_printer_id(printer_id)
+    preset = PRINTER_PRESETS[pid]
+    values = dict(_MODULE_DEFAULTS)
+    values.update(preset.overrides)
+    for name, value in values.items():
+        globals()[name] = value
+    MARKER = preset.marker
+    _ACTIVE_PRINTER_ID = pid
+    _recompute_derived_constants()
+    return pid
+
+
+def active_printer_id() -> str:
+    return _ACTIVE_PRINTER_ID
+
 EXPORT_FOLDER_NAMES = ("Downloads")
 EXPORT_MAX_AGE_S = 300
 EXPORT_MAX_FILES = 5
@@ -301,6 +543,8 @@ class E5S1Profile(TypedDict):
     first_layer_temperature_c: str
     nozzle_diameter_mm: float
     max_volumetric_flow: float
+
+PrinterProfile = E5S1Profile
 
 class GcodeAnalysis(TypedDict):
     overhang_markers: int
@@ -412,8 +656,8 @@ def parse_prusa_config(text: str) -> dict[str, str]:
         out[key.strip()] = val.strip()
     return _merge_custom_parameters(out)
 
-def build_e5s1_profile() -> E5S1Profile:
-    """Perfil E5S1 calibrado — sempre hardcoded; ignora bundle e config do slicer."""
+def build_printer_profile() -> PrinterProfile:
+    """Perfil calibrado da impressora ativa — sempre hardcoded; ignora bundle e config do slicer."""
     return {
         "retract_mm": RETRACT_LENGTH_MM,
         "retract_f": mm_s_to_f(RETRACT_SPEED_MM_S),
@@ -458,6 +702,9 @@ def build_e5s1_profile() -> E5S1Profile:
         "max_volumetric_flow": MAX_VOLUMETRIC_FLOW_MM3_S,
     }
 
+def build_e5s1_profile() -> E5S1Profile:
+    return build_printer_profile()
+
 def _axis_float(match: re.Match[str] | None) -> float | None:
     if not match:
         return None
@@ -487,6 +734,28 @@ def _motion_step_mm(line: str, x0: float | None, y0: float | None) -> tuple[floa
                     da += 2 * math.pi
                 return abs(r * da), x1, y1
     return math.hypot(x1 - x0, y1 - y0), x1, y1
+
+def _adjust_e_on_line(
+    line: str,
+    *,
+    delta: float = 0.0,
+    ratio: float = 1.0,
+    comment: str | None = None,
+) -> str | None:
+    m = E_VAL_RE.search(line)
+    if not m:
+        return None
+    e_val = float(m.group(1))
+    if e_val <= 0:
+        return None
+    new_e = e_val * ratio + delta
+    if new_e <= 0:
+        return None
+    head = line.split(";", 1)[0]
+    head = E_VAL_RE.sub(f"E{new_e:.5f}", head, count=1)
+    if comment:
+        return f"{head.rstrip()} ; {comment}"
+    return E_VAL_RE.sub(f"E{new_e:.5f}", line, count=1)
 
 def _coast_e_on_line(line: str, coast_e: float, *, min_remain: float = COAST_MIN_REMAIN_E_MM) -> str | None:
     m = E_VAL_RE.search(line)
@@ -529,9 +798,9 @@ def _scan_bbox_start(lines: list[str]) -> int:
 
 def _skirt_safe_approach(x0: float, y0: float, z_print: float) -> list[str]:
     return [
-        f"G1 Z{STARTUP_SAFE_Z_MM} F{SKIRT_Z_F} ; postprocess safe z",
+        f"G1 Z{STARTUP_SAFE_Z_MM} F{Z_MOVE_F} ; postprocess safe z",
         f"G1 X{x0:.3f} Y{y0:.3f} F{SKIRT_TRAVEL_F} ; postprocess travel",
-        f"G1 Z{z_print:.3f} F{SKIRT_Z_F} ; postprocess skirt",
+        f"G1 Z{z_print:.3f} F{Z_MOVE_F} ; postprocess skirt",
     ]
 
 def _next_marker_idx(lines: list[str], start: int, marker: str, *, max_forward: int = 40) -> int | None:
@@ -611,6 +880,45 @@ def _coast_travel_body_start(lines: list[str]) -> int:
         if LAYER_CHANGE_MARKER in line:
             return i + 1
     return head_index(lines, fallback=0)
+
+def _iter_body_travel_events(
+    lines: list[str],
+    *,
+    body_start: int | None = None,
+    body_end: int | None = None,
+):
+    if body_start is None:
+        body_start = _coast_travel_body_start(lines)
+    if body_end is None:
+        body_end = _print_body_end(lines)
+    last_x = last_y = None
+    last_ext_i: int | None = None
+    for i in range(body_start, body_end):
+        line = lines[i]
+        if any(m in line for m in LAYER_MARKERS):
+            last_ext_i = None
+            continue
+        if not _is_gcode_motion_line(line):
+            continue
+        low = line.lower()
+        if "postprocess purge" in low or PP_SKIRT in low:
+            continue
+        upper = line.strip().upper()
+        m_e = E_VAL_RE.search(upper)
+        e_val = float(m_e.group(1)) if m_e else 0.0
+        is_extrude = e_val > COAST_MIN_REMAIN_E_MM
+        step, x, y = _motion_step_mm(line, last_x, last_y)
+        ext_i: int | None = None
+        if is_extrude:
+            last_ext_i = i
+        elif last_ext_i is not None:
+            ext_i = last_ext_i
+            last_ext_i = None
+        yield i, is_extrude, step, ext_i
+        if x is not None:
+            last_x = x
+        if y is not None:
+            last_y = y
 
 def analysis_after_transform(base: GcodeAnalysis, result: str, prusa_cfg: dict[str, str]) -> GcodeAnalysis:
     updated = dict(base)
@@ -728,7 +1036,7 @@ class GCodeBuilder:
         return f"G1 E-{mm} F{retract_f} ; postprocess seam extra retract"
 
     def z_hop(self, mm: float) -> str:
-        return f"G91\nG1 Z{mm} F{Z_HOP_F} ; postprocess z hop\nG90"
+        return f"G91\nG1 Z{mm} F{Z_MOVE_F} ; postprocess z hop\nG90"
 
     def layer_retract(self, mm: float, retract_f: int) -> str:
         return f"G1 E-{mm} F{retract_f} ; postprocess layer retract"
@@ -777,7 +1085,7 @@ G92 E0 ; postprocess purge"""
         return f"; {PP_SKIRT}"
 
     def skirt_z(self, z: float) -> str:
-        return f"G1 Z{z} F{SKIRT_Z_F} ; {PP_SKIRT}"
+        return f"G1 Z{z} F{Z_MOVE_F} ; {PP_SKIRT}"
 
     def skirt_travel(self, x: float, y: float, f: int = SKIRT_TRAVEL_F) -> str:
         return f"G1 X{x} Y{y} F{f} ; {PP_SKIRT}"
@@ -887,7 +1195,7 @@ class GCodeAnalyzer:
         return overhang_markers >= SUPPORT_OVERHANG_MIN and not has_support
 
     def is_postprocessed(self, text: str) -> bool:
-        return MARKER in text
+        return any(marker in text for marker in ALL_POSTPROCESS_MARKERS)
 
     def count_pp_fan_lines(self, text: str) -> int:
         return len(PP_FAN_RE.findall(text))
@@ -1126,15 +1434,17 @@ def e5s1_fan_target_label(
 ) -> tuple[int, str] | None:
     if pwm_key := FAN_PROFILE_KEYS.get(kind):
         return profile[pwm_key], kind
-    if kind in FEAT_SEAM and layer_count > profile["fan_off_layers"]:
+    if layer_count <= profile["fan_off_layers"]:
+        if kind in FEAT_PERIMETER:
+            return profile["min_fan_pwm"], "adhesion"
+        if kind in {"bottom", "brim"}:
+            return (layer_fan_cap if layer_fan_cap is not None else 0), "adhesion"
+        return None
+    if kind in FEAT_PERIMETER:
         if max_part_cooling:
             return profile["max_fan_pwm"], "max_cooling"
         pwm = min(profile["seam_fan_pwm"], profile["min_fan_pwm"]) if kind == "perimeter" else profile["seam_fan_pwm"]
         return pwm, "seam"
-    if kind in (FEAT_SEAM | {"bottom", "brim"}) and layer_count <= profile["fan_off_layers"]:
-        if kind in FEAT_SEAM:
-            return profile["min_fan_pwm"], "adhesion"
-        return (layer_fan_cap if layer_fan_cap is not None else 0), "adhesion"
     return None
 
 def tune_fan_speed(
@@ -1191,6 +1501,37 @@ def head_index(lines: list[str], fallback: int | None = None) -> int:
     if fallback is not None:
         return fallback
     return min(len(lines), PA_PROBE_LINES)
+
+def _repair_region(lines: list[str], body_start: int | None) -> tuple[int, list[str]]:
+    start = body_start if body_start is not None else head_index(lines)
+    return start, lines[start:]
+
+def _splice_region(lines: list[str], start: int, region: list[str]) -> list[str]:
+    return lines[:start] + region
+
+def _apply_line_overrides(region: list[str], overrides: dict[int, str]) -> list[str]:
+    if not overrides:
+        return region
+    out = list(region)
+    for idx in sorted(overrides, reverse=True):
+        out[idx] = overrides[idx]
+    return out
+
+def _inject_sorted(
+    region: list[str],
+    before: dict[int, list[str]],
+    after: dict[int, list[str]],
+) -> list[str]:
+    if not before and not after:
+        return region
+    out = list(region)
+    for idx in sorted(after, reverse=True):
+        for ln in reversed(after[idx]):
+            out.insert(idx + 1, ln)
+    for idx in sorted(before, reverse=True):
+        for ln in reversed(before[idx]):
+            out.insert(idx, ln)
+    return out
 
 def scan_bounding_box(lines: list[str]) -> tuple[float, float, float, float] | None:
     min_x = min_y = float("inf")
@@ -1492,7 +1833,7 @@ def repair_startup(
     result = head + tail if changed else lines
     return result, len(head)
 
-def _segment_closed(region: list[str], seg: list[int]) -> bool:
+def _segment_end_gap(region: list[str], seg: list[int]) -> float | None:
     sx = sy = lx = ly = None
     for idx in seg:
         upper = region[idx].upper()
@@ -1506,8 +1847,138 @@ def _segment_closed(region: list[str], seg: list[int]) -> bool:
             sx, sy = x, y
         lx, ly = x, y
     if sx is None or lx is None:
-        return False
-    return math.hypot(lx - sx, ly - sy) <= LOOP_CLOSE_TOL_MM
+        return None
+    return math.hypot(lx - sx, ly - sy)
+
+def _segment_closed(region: list[str], seg: list[int], *, tol_mm: float = LOOP_CLOSE_TOL_MM) -> bool:
+    gap = _segment_end_gap(region, seg)
+    return gap is not None and gap <= tol_mm
+
+def _segment_is_loop(region: list[str], seg: list[int], closed: bool) -> bool:
+    if closed:
+        return True
+    gap = _segment_end_gap(region, seg)
+    return gap is not None and gap <= LOOP_NEAR_CLOSE_TOL_MM
+
+def _is_first_layer(layer: int) -> bool:
+    return layer <= FIRST_LAYER_REPAIR_MAX_LAYER
+
+def _small_loop_max_mm(layer: int) -> float:
+    return FIRST_LAYER_LOOP_MAX_MM if _is_first_layer(layer) else SMALL_LOOP_SMALL_MAX_MM
+
+def _extra_restart_amount(layer: int, dist: float) -> float:
+    tiny = dist < SMALL_LOOP_TINY_MAX_MM
+    if _is_first_layer(layer):
+        return FIRST_LAYER_EXTRA_TINY_MM if tiny else FIRST_LAYER_EXTRA_RESTART_MM
+    return EXTRA_DERETRACT_TINY_MM if tiny else EXTRA_DERETRACT_RESTART_MM
+
+_PP_LOOP_PRIME_MARKERS = (
+    "postprocess extra restart",
+    "postprocess loop start prime",
+    "first layer loop start prime",
+)
+
+def _line_already_primed(line: str) -> bool:
+    low = line.lower()
+    return any(marker in low for marker in _PP_LOOP_PRIME_MARKERS)
+
+class _WallApproach(NamedTuple):
+    retract_idx: int | None
+    traveled: bool
+    blocked: bool
+
+def _walk_before_wall(
+    region: list[str],
+    wall_start: int,
+    *,
+    lookback: int = EXTRA_DERETRACT_LOOKBACK,
+) -> _WallApproach:
+    traveled = False
+    for j in range(wall_start - 1, max(wall_start - lookback, -1), -1):
+        line = region[j]
+        if _line_already_primed(line):
+            return _WallApproach(None, False, True)
+        if any(m in line for m in LAYER_MARKERS):
+            return _WallApproach(None, False, True)
+        stripped = line.strip()
+        feat = type_feature(line)
+        if feat is not None and feat not in FEAT_PERIMETER:
+            return _WallApproach(None, False, True)
+        if RETRACT_RE.match(stripped):
+            return _WallApproach(j, traveled, False)
+        if G1_EXTRUDE_RE.match(stripped):
+            m = E_VAL_RE.search(stripped.upper())
+            if not m:
+                continue
+            e_val = float(m.group(1))
+            if e_val < 0:
+                return _WallApproach(j, traveled, False)
+            if e_val > 0 and (X_VAL_RE.search(stripped) or Y_VAL_RE.search(stripped)):
+                return _WallApproach(None, traveled, False)
+            continue
+        upper = stripped.upper()
+        if upper.startswith(("G0", "G1")) and (
+            X_VAL_RE.search(stripped) or Y_VAL_RE.search(stripped)
+        ):
+            m = E_VAL_RE.search(upper)
+            if m is None or float(m.group(1)) <= 0:
+                traveled = True
+    return _WallApproach(None, traveled, False)
+
+def _loop_restart_deretract_idx(
+    region: list[str],
+    wall_start: int,
+    approach: _WallApproach,
+) -> int | None:
+    if approach.blocked or approach.retract_idx is None:
+        return None
+    for k in range(approach.retract_idx + 1, wall_start):
+        if _line_already_primed(region[k]):
+            return None
+        stripped = region[k].strip()
+        if not G1_EXTRUDE_RE.match(stripped):
+            continue
+        m = E_VAL_RE.search(stripped.upper())
+        if m and float(m.group(1)) > 0:
+            return k
+    return None
+
+def _needs_loop_start_prime(
+    region: list[str],
+    seg: list[int],
+    closed: bool,
+    layer: int,
+    wall_start: int,
+    dist: float,
+    approach: _WallApproach,
+) -> bool:
+    if _is_first_layer(layer) and _segment_is_loop(region, seg, closed):
+        return True
+    if (
+        _is_first_layer(layer)
+        and not _segment_is_loop(region, seg, closed)
+        and dist < FIRST_LAYER_SMALL_OPEN_MAX_MM
+        and approach.traveled
+    ):
+        return True
+    return not approach.blocked and (approach.retract_idx is not None or approach.traveled)
+
+def _loop_start_prime_comment(layer: int, approach: _WallApproach) -> str:
+    if _is_first_layer(layer):
+        return "first layer loop start prime"
+    if approach.retract_idx is not None:
+        return "postprocess extra restart"
+    return "postprocess loop start prime"
+
+def _seam_join_flow_pct(layer: int, small_loop: bool, default_flow: int) -> int:
+    if not small_loop:
+        return default_flow
+    return FIRST_LAYER_SEAM_FLOW_SMALL_PCT if _is_first_layer(layer) else SEAM_FLOW_SMALL_PCT
+
+def _seam_join_e_boost(layer: int) -> tuple[float, str]:
+    if _is_first_layer(layer):
+        return FIRST_LAYER_SEAM_JOIN_E_BOOST_RATIO, "first layer loop close e boost"
+    return SEAM_JOIN_E_BOOST_RATIO, "postprocess loop close e boost"
 
 def _collect_perimeter_segments(
     region: list[str],
@@ -1520,22 +1991,27 @@ def _collect_perimeter_segments(
     last_x, last_y = None, None
     layer_num = 0
 
+    def flush_segment() -> None:
+        nonlocal curr_seg, curr_dist
+        if not curr_seg:
+            return
+        segments.append((
+            curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg), curr_kind,
+        ))
+        curr_seg = []
+
     for i, line in enumerate(region):
         if any(m in line for m in LAYER_MARKERS):
             layer_num += 1
         feat = type_feature(line)
         if feat in FEAT_PERIMETER:
-            if curr_seg:
-                segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg), curr_kind))
+            flush_segment()
             in_perimeter = True
             curr_kind = feat
-            curr_seg = []
             curr_dist = 0.0
         elif feat is not None:
             in_perimeter = False
-            if curr_seg:
-                segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg), curr_kind))
-                curr_seg = []
+            flush_segment()
 
         upper = line.upper()
         if upper.startswith(("G0", "G1", "G2", "G3")):
@@ -1550,14 +2026,12 @@ def _collect_perimeter_segments(
                 elif step > 0:
                     curr_dist += step
                 curr_seg.append(i)
-            elif curr_seg:
-                segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg), curr_kind))
-                curr_seg = []
+            else:
+                flush_segment()
 
             last_x, last_y = x, y
 
-    if curr_seg:
-        segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg), curr_kind))
+    flush_segment()
     return segments
 
 def _feature_before(lines: list[str], idx: int, lookback: int = 24) -> str | None:
@@ -1589,9 +2063,9 @@ def _infill_long_travel(lines: list[str], ext_i: int, travel_i: int, travel_mm: 
         return False
     return src in FEAT_INFILL and dst in FEAT_INFILL
 
-def _small_perimeter_speed_cap(layer: int, dist: float, closed: bool) -> tuple[int, str] | None:
-    if layer <= FIRST_LAYER_REPAIR_MAX_LAYER:
-        if closed:
+def _small_perimeter_speed_cap(layer: int, dist: float, loop_like: bool) -> tuple[int, str] | None:
+    if _is_first_layer(layer):
+        if loop_like:
             if dist < FIRST_LAYER_LOOP_TINY_MAX_MM:
                 return mm_s_to_f(FIRST_LAYER_LOOP_TINY_SPEED_MM_S), "postprocess first layer tiny loop"
             if dist < FIRST_LAYER_LOOP_MAX_MM:
@@ -1599,7 +2073,7 @@ def _small_perimeter_speed_cap(layer: int, dist: float, closed: bool) -> tuple[i
         elif dist < FIRST_LAYER_SMALL_OPEN_MAX_MM:
             return mm_s_to_f(FIRST_LAYER_SMALL_OPEN_SPEED_MM_S), "postprocess first layer small open"
         return None
-    if closed:
+    if loop_like:
         if dist < SMALL_LOOP_TINY_MAX_MM:
             return mm_s_to_f(SMALL_LOOP_TINY_SPEED_MM_S), "postprocess tiny loop"
         if dist < SMALL_LOOP_SMALL_MAX_MM:
@@ -1616,44 +2090,45 @@ def repair_perimeter_seam_join(
     *,
     body_start: int | None = None,
 ) -> list[str]:
-    start = body_start if body_start is not None else head_index(lines)
-    region = lines[start:]
+    start, region = _repair_region(lines, body_start)
     inject_before: dict[int, list[str]] = {}
     inject_after: dict[int, list[str]] = {}
     overrides: dict[int, str] = {}
     join_f = profile["seam_join_f"]
-    seam_flow = profile["seam_flow_pct"]
     joined = 0
+    flow_joined = 0
 
-    for seg, dist, _layer, closed, kind in _collect_perimeter_segments(region):
-        if not closed or not seg:
+    for seg, dist, layer, closed, _kind in _collect_perimeter_segments(region):
+        if not _segment_is_loop(region, seg, closed) or not seg:
             continue
         i1 = seg[-1]
-        overrides[i1] = cap_f_line(region[i1], join_f, join_f, builder)[0] + " ; postprocess loop close cap"
+        small_loop = dist < _small_loop_max_mm(layer)
+        join_line = cap_f_line(region[i1], join_f, join_f, builder)[0]
+        if small_loop:
+            boost_ratio, tag = _seam_join_e_boost(layer)
+            boosted = _adjust_e_on_line(join_line, ratio=boost_ratio)
+            if boosted:
+                join_line = boosted + f" ; {tag}"
+        overrides[i1] = join_line + " ; postprocess loop close cap"
         joined += 1
-        if kind == "external" and seam_flow < FLOW_NORMAL_PCT:
+        flow_pct = _seam_join_flow_pct(layer, small_loop, profile["seam_flow_pct"])
+        if flow_pct != FLOW_NORMAL_PCT:
+            join_mm = SEAM_JOIN_FLOW_SMALL_MM if small_loop else SEAM_JOIN_FLOW_MM
             cum = _segment_cumulative_dist(region, seg)
-            join_start = next((idx for idx, d in cum if dist - d <= SEAM_JOIN_FLOW_MM), None)
+            join_start = next((idx for idx, d in cum if dist - d <= join_mm), None)
             if join_start is not None:
-                inject_before.setdefault(join_start, []).append(
-                    builder.flow_seam(seam_flow),
-                )
+                inject_before.setdefault(join_start, []).append(builder.flow_seam(flow_pct))
                 inject_after.setdefault(i1, []).append(builder.flow_reset())
+                flow_joined += 1
 
     if not joined:
         return lines
 
-    out = list(region)
-    for idx in sorted(overrides, reverse=True):
-        out[idx] = overrides[idx]
-    for idx in sorted(inject_after, reverse=True):
-        for ln in reversed(inject_after[idx]):
-            out.insert(idx + 1, ln)
-    for idx in sorted(inject_before, reverse=True):
-        for ln in reversed(inject_before[idx]):
-            out.insert(idx, ln)
+    out = _inject_sorted(_apply_line_overrides(region, overrides), inject_before, inject_after)
     actions.append(f"perimeter_seam_join×{joined}")
-    return lines[:start] + out
+    if flow_joined:
+        actions.append(f"flow_seam_join×{flow_joined}")
+    return _splice_region(lines, start, out)
 
 def repair_small_perimeter_speed(
     lines: list[str],
@@ -1662,8 +2137,7 @@ def repair_small_perimeter_speed(
     *,
     body_start: int | None = None,
 ) -> list[str]:
-    start = body_start if body_start is not None else head_index(lines)
-    region = lines[start:]
+    start, region = _repair_region(lines, body_start)
     overrides: dict[int, str] = {}
     counts: dict[str, int] = {}
     adjusted = 0
@@ -1671,7 +2145,7 @@ def repair_small_perimeter_speed(
     for seg, dist, layer, closed, _kind in _collect_perimeter_segments(region):
         if not seg:
             continue
-        cap = _small_perimeter_speed_cap(layer, dist, closed)
+        cap = _small_perimeter_speed_cap(layer, dist, _segment_is_loop(region, seg, closed))
         if cap is None:
             continue
         cap_f, comment = cap
@@ -1684,12 +2158,12 @@ def repair_small_perimeter_speed(
     if not adjusted:
         return lines
 
-    out = list(region)
-    for idx in sorted(overrides, reverse=True):
-        out[idx] = overrides[idx]
-    detail = ",".join(f"{k.rsplit(' ', 1)[-1]}×{v}" for k, v in sorted(counts.items()))
-    actions.append(f"small_perimeter_speed×{adjusted}({detail})")
-    return lines[:start] + out
+    actions.append(
+        f"small_perimeter_speed×{adjusted}("
+        + ",".join(f"{k.rsplit(' ', 1)[-1]}×{v}" for k, v in sorted(counts.items()))
+        + ")",
+    )
+    return _splice_region(lines, start, _apply_line_overrides(region, overrides))
 
 def repair_coast(lines: list[str], actions: list[str]) -> list[str]:
     out = list(lines)
@@ -1714,41 +2188,17 @@ def repair_coast(lines: list[str], actions: list[str]) -> list[str]:
 
 def repair_travel_coast(lines: list[str], actions: list[str]) -> list[str]:
     out = list(lines)
-    body_start = _coast_travel_body_start(out)
-    body_end = _print_body_end(out)
-    last_x, last_y = None, None
-    last_ext_i: int | None = None
     coasted = 0
-    for i in range(body_start, body_end):
-        line = out[i]
-        if any(m in line for m in LAYER_MARKERS):
-            last_ext_i = None
+    for i, is_extrude, step, ext_i in _iter_body_travel_events(out):
+        if is_extrude or ext_i is None:
             continue
-        if not _is_gcode_motion_line(line):
+        if "postprocess coast" in out[ext_i]:
             continue
-        upper = line.strip().upper()
-        low = line.lower()
-        if "postprocess purge" in low or PP_SKIRT in low:
-            continue
-        m_e = E_VAL_RE.search(upper)
-        e_val = float(m_e.group(1)) if m_e else 0.0
-        is_extrude = e_val > COAST_MIN_REMAIN_E_MM
-        step, x, y = _motion_step_mm(line, last_x, last_y)
-        if is_extrude:
-            last_ext_i = i
-        elif last_ext_i is not None:
-            ext_i = cast(int, last_ext_i)
-            if "postprocess coast" not in out[ext_i]:
-                if _infill_long_travel(out, ext_i, i, step):
-                    new_line = _coast_e_on_line(out[ext_i], COAST_E_MM)
-                    if new_line:
-                        out[ext_i] = new_line + " ; postprocess coast travel"
-                        coasted += 1
-            last_ext_i = None
-        if x is not None:
-            last_x = x
-        if y is not None:
-            last_y = y
+        if _infill_long_travel(out, ext_i, i, step):
+            new_line = _coast_e_on_line(out[ext_i], COAST_E_MM)
+            if new_line:
+                out[ext_i] = new_line + " ; postprocess coast travel"
+                coasted += 1
     if coasted:
         actions.append(f"coast_travel×{coasted}")
     return out
@@ -1760,42 +2210,13 @@ def repair_travel_retract(
     actions: list[str],
 ) -> list[str]:
     out = list(lines)
-    body_start = _coast_travel_body_start(out)
-    body_end = _print_body_end(out)
-    last_x, last_y = None, None
-    last_ext_i: int | None = None
     retracted = 0
-    for i in range(body_start, body_end):
-        line = out[i]
-        low = line.lower()
-        if "postprocess purge" in low or PP_SKIRT in low:
+    for i, is_extrude, step, ext_i in _iter_body_travel_events(out):
+        if is_extrude or ext_i is None:
             continue
-        if any(m in line for m in LAYER_MARKERS):
-            last_ext_i = None
-            continue
-        if not _is_gcode_motion_line(line):
-            continue
-        upper = line.strip().upper()
-        m_e = E_VAL_RE.search(upper)
-        e_val = float(m_e.group(1)) if m_e else 0.0
-        is_extrude = e_val > COAST_MIN_REMAIN_E_MM
-        step, x, y = _motion_step_mm(line, last_x, last_y)
-        if is_extrude:
-            last_ext_i = i
-        elif last_ext_i is not None:
-            ext_i = cast(int, last_ext_i)
-            if _infill_long_travel(out, ext_i, i, step) and not _has_retract_between(out, ext_i, i):
-                out.insert(
-                    i,
-                    builder.travel_retract(TRAVEL_RETRACT_MM, profile["retract_f"]),
-                )
-                retracted += 1
-                i += 1
-            last_ext_i = None
-        if x is not None:
-            last_x = x
-        if y is not None:
-            last_y = y
+        if _infill_long_travel(out, ext_i, i, step) and not _has_retract_between(out, ext_i, i):
+            out.insert(i, builder.travel_retract(TRAVEL_RETRACT_MM, profile["retract_f"]))
+            retracted += 1
     if retracted:
         actions.append(f"travel_retract×{retracted}")
     return out
@@ -1912,9 +2333,9 @@ def _near_layer_start(lines: list[str], idx: int, lookback: int = 16) -> bool:
 def _active_wall_feature(lines: list[str], idx: int, lookback: int = 12) -> bool:
     for j in range(idx - 1, max(idx - lookback, -1), -1):
         feat = type_feature(lines[j])
-        if feat in FEAT_SEAM:
+        if feat in FEAT_PERIMETER:
             return True
-        if feat is not None and feat not in FEAT_SEAM:
+        if feat is not None and feat not in FEAT_PERIMETER:
             return False
     return False
 
@@ -1922,7 +2343,7 @@ def _wall_travel_target(lines: list[str], travel_i: int, lookahead: int = 16) ->
     for j in range(travel_i + 1, min(travel_i + lookahead, len(lines))):
         if any(m in lines[j] for m in LAYER_MARKERS):
             return False
-        if type_feature(lines[j]) in FEAT_SEAM:
+        if type_feature(lines[j]) in FEAT_PERIMETER:
             return True
         stripped = lines[j].strip()
         if G1_EXTRUDE_RE.match(stripped):
@@ -1966,6 +2387,88 @@ def _after_layer_travel(lines: list[str], idx: int, lookback: int = 20) -> bool:
                 return False
     return False
 
+def _segment_wall_start(region: list[str], seg: list[int]) -> int:
+    for idx in seg:
+        stripped = region[idx].strip()
+        if not G1_EXTRUDE_RE.match(stripped):
+            continue
+        m = E_VAL_RE.search(stripped.upper())
+        if not m or float(m.group(1)) <= 0:
+            continue
+        if X_VAL_RE.search(stripped) or Y_VAL_RE.search(stripped):
+            return idx
+    return seg[0]
+
+def repair_extra_deretract_restart(
+    lines: list[str],
+    actions: list[str],
+    *,
+    body_start: int | None = None,
+) -> list[str]:
+    """Extra material at loop start after travel/retract (hole circles, seam_gap loops)."""
+    start, region = _repair_region(lines, body_start)
+    overrides: dict[int, str] = {}
+    boosted = 0
+    wall_primed = 0
+    touched: set[int] = set()
+
+    for seg, dist, layer, closed, _kind in _collect_perimeter_segments(region):
+        if not seg:
+            continue
+        loop_like = _segment_is_loop(region, seg, closed)
+        if loop_like and dist >= _small_loop_max_mm(layer):
+            continue
+        if not loop_like and (
+            not _is_first_layer(layer) or dist >= FIRST_LAYER_SMALL_OPEN_MAX_MM
+        ):
+            continue
+
+        wall_start = _segment_wall_start(region, seg)
+        if _line_already_primed(region[wall_start]):
+            continue
+
+        approach = _walk_before_wall(region, wall_start)
+        extra = _extra_restart_amount(layer, dist)
+        retract_idx = _loop_restart_deretract_idx(region, wall_start, approach)
+        if retract_idx is not None and retract_idx not in touched:
+            new_line = _adjust_e_on_line(
+                region[retract_idx], delta=extra, comment="postprocess extra restart",
+            )
+            if new_line:
+                overrides[retract_idx] = new_line
+                touched.add(retract_idx)
+                boosted += 1
+            continue
+
+        if not _needs_loop_start_prime(
+            region, seg, closed, layer, wall_start, dist, approach,
+        ) or wall_start in touched:
+            continue
+        comment = _loop_start_prime_comment(layer, approach)
+        new_line = _adjust_e_on_line(region[wall_start], delta=extra, comment=comment)
+        if new_line:
+            overrides[wall_start] = new_line
+            touched.add(wall_start)
+            wall_primed += 1
+
+    if not boosted and not wall_primed:
+        return lines
+
+    out = _apply_line_overrides(region, overrides)
+    parts: list[str] = []
+    if boosted:
+        parts.append(f"boost×{boosted}")
+    if wall_primed:
+        parts.append(f"wall×{wall_primed}")
+    l1 = sum(
+        1 for idx in overrides
+        if "first layer loop start prime" in overrides[idx].lower()
+    )
+    if l1:
+        parts.append(f"l1×{l1}")
+    actions.append(f"extra_restart_{','.join(parts)}")
+    return _splice_region(lines, start, out)
+
 def _slow_deretract_line(
     out: list[str],
     idx: int,
@@ -1985,13 +2488,26 @@ def _slow_deretract_line(
     out[idx] = f"{head} ; postprocess deretract slow"
     return True
 
+def _deretract_slow_max_e(line: str) -> float:
+    if _line_already_primed(line):
+        return SLICER_DERETRACT_MAX_E_MM + FIRST_LAYER_EXTRA_TINY_MM
+    return SLICER_DERETRACT_MAX_E_MM
+
 def repair_deretract(lines: list[str], actions: list[str]) -> list[str]:
     out = list(lines)
     slowed = 0
     i = 0
     while i < len(out):
         low = out[i].lower()
-        if "postprocess" in low and "e-" in low and RETRACT_RE.match(out[i].strip()):
+        if _line_already_primed(out[i]):
+            max_e = (
+                FIRST_LAYER_EXTRA_TINY_MM
+                if "first layer loop start prime" in low
+                else EXTRA_DERETRACT_TINY_MM
+            )
+            if _slow_deretract_line(out, i, max_e=max_e):
+                slowed += 1
+        elif "postprocess" in low and "e-" in low and RETRACT_RE.match(out[i].strip()):
             for j in range(i + 1, min(i + 16, len(out))):
                 stripped = out[j].strip()
                 if not G1_EXTRUDE_RE.match(stripped):
@@ -2009,7 +2525,7 @@ def repair_deretract(lines: list[str], actions: list[str]) -> list[str]:
                     and not _active_wall_feature(out, i)))
                 and not _after_layer_travel(out, i)
                 and not _near_layer_start(out, i)) and _slow_deretract_line(
-            out, i, max_e=SLICER_DERETRACT_MAX_E_MM,
+            out, i, max_e=_deretract_slow_max_e(out[i]),
         ):
             slowed += 1
         i += 1
@@ -2216,7 +2732,6 @@ class TransformContext:
         self.boost_fan = False
         self.cool_boost = False
         self.flow_bridge = False
-        self.seam_flow = False
         self.surface_kind: str | None = None
         self.pending_surface_clear = False
         self.last_f = profile["default_motion_f"]
@@ -2232,17 +2747,24 @@ class TransformContext:
         self.current_upper = line.upper()
 
     def reset_flow(self) -> None:
-        if self.flow_bridge or self.seam_flow:
+        if self.flow_bridge:
             self.out.append(self.builder.flow_reset())
             self.actions.append("flow_reset")
             self.flow_bridge = False
-            self.seam_flow = False
+
+    def clear_layer_flags(self) -> None:
+        if self.cool_boost:
+            self.restore_layer_fan()
+        self.reset_flow()
+        self.boost_fan = False
+        self.cool_boost = False
+        self.pending_surface_clear = True
 
     def apply_pa(self, feat: str) -> None:
         if self.builder.pa_fw != PA_FIRMWARE or self.profile["pa_k"] <= 0:
             return
         scale = 1.0
-        if feat in FEAT_SEAM:
+        if feat in FEAT_PERIMETER:
             scale = PA_PERIMETER_SCALE
         elif feat in ("internal", "solid"):
             scale = PA_INFILL_SCALE
@@ -2389,52 +2911,32 @@ def transform_ironing_fan(ctx: TransformContext, _lines: list[str], _idx: int) -
 def transform_layer_boundary(ctx: TransformContext, lines: list[str], idx: int) -> bool:
     if AFTER_LAYER_MARKER in ctx.current_line and ctx.uses_before_after_markers:
         ctx.in_startup = False
-        if ctx.cool_boost:
-            ctx.restore_layer_fan()
-        ctx.reset_flow()
-        ctx.boost_fan = False
-        ctx.cool_boost = False
-        ctx.pending_surface_clear = True
+        ctx.clear_layer_flags()
         ctx.out.append(ctx.current_line)
         return True
     if LAYER_BEFORE_MARKER in ctx.current_line:
         ctx.in_startup = False
-        if ctx.cool_boost:
-            ctx.restore_layer_fan()
-        ctx.reset_flow()
+        ctx.clear_layer_flags()
         if LAYER_RETRACT and ctx.layer_count >= 1 and not recent_retract(ctx.out):
             if not ctx.uses_before_after_markers and not _slicer_layer_prep_before(lines, idx):
-                seam_extra = ctx.surface_kind in FEAT_SEAM
+                seam_extra = ctx.surface_kind in FEAT_PERIMETER
                 ctx.out.extend(layer_retract_lines(
                     ctx.profile, ctx.builder, seam_extra=seam_extra, last_x=ctx.last_x, last_y=ctx.last_y,
                 ))
                 ctx.actions.append("retract_layer")
                 if seam_extra and ctx.profile["seam_extra_retract"] > 0:
                     ctx.actions.append("seam_extra_retract")
-        ctx.boost_fan = False
-        ctx.cool_boost = False
-        ctx.pending_surface_clear = True
         ctx.begin_layer(ctx.current_line)
         return True
     if AFTER_LAYER_MARKER in ctx.current_line:
         ctx.in_startup = False
-        if ctx.cool_boost:
-            ctx.restore_layer_fan()
-        ctx.reset_flow()
-        ctx.boost_fan = False
-        ctx.cool_boost = False
-        ctx.pending_surface_clear = True
+        ctx.clear_layer_flags()
         ctx.begin_layer(ctx.current_line)
         return True
     if LAYER_CHANGE_MARKER in ctx.current_line:
         ctx.in_startup = False
         if not ctx.uses_before_after_markers or ctx.layer_count == 0:
-            if ctx.cool_boost:
-                ctx.restore_layer_fan()
-            ctx.reset_flow()
-            ctx.boost_fan = False
-            ctx.cool_boost = False
-            ctx.pending_surface_clear = True
+            ctx.clear_layer_flags()
             ctx.begin_layer(ctx.current_line)
         else:
             ctx.out.append(ctx.current_line)
@@ -2538,7 +3040,7 @@ def transform_gcode(
     analysis: GcodeAnalysis,
     prusa_cfg: dict[str, str] | None = None,
 ) -> tuple[list[str], list[str]]:
-    profile = build_e5s1_profile()
+    profile = build_printer_profile()
     pa_fw = PA_FIRMWARE
     need_sup = analysis["needs_support"]
     skip_overhang_fan = analysis["large"] and analysis["overhang_markers"] > OVERHANG_FAN_SKIP_THRESHOLD and not need_sup
@@ -2592,6 +3094,7 @@ def transform_gcode(
     out = repair_travel_coast(out, repair_actions)
     out = repair_travel_retract(out, profile, builder, repair_actions)
     out = repair_travel_start_boost(out, builder, repair_actions)
+    out = repair_extra_deretract_restart(out, repair_actions, body_start=body_start)
     out = repair_deretract(out, repair_actions)
     out = repair_stale_layer_wipe(out, repair_actions)
     out = repair_stale_layer_gap(out, repair_actions)
@@ -2663,7 +3166,8 @@ class RecentExportFinder:
             for candidate in self._recent_gcode_candidates(folder, now, max_age_s, max_files, warnings):
                 try:
                     with candidate.open(encoding="utf-8", errors="replace") as f:
-                        if MARKER in f.read(MARKER_HEAD_BYTES):
+                        head = f.read(MARKER_HEAD_BYTES)
+                        if any(marker in head for marker in ALL_POSTPROCESS_MARKERS):
                             return candidate, warnings
                 except OSError as exc:
                     warnings.append(f"export read failed {candidate}: {exc}")
@@ -2688,7 +3192,7 @@ class StateLogger:
         self._ensure_log_dir()
 
     def _ensure_log_dir(self) -> None:
-        LOG_DIR.mkdir(exist_ok=True)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     def log(self, event: str, message: str = "", echo: bool = True) -> None:
         self._ensure_log_dir()
@@ -2765,6 +3269,12 @@ class PostProcessApp:
             self.logger = logger
 
     def run(self, paths: list[Path], quiet: bool = False, force: bool = False, argv: list[str] | None = None) -> int:
+        try:
+            printer_id = activate_printer(resolve_printer_id(argv))
+        except ValueError as exc:
+            self.logger.log_fail(str(exc), quiet)
+            return 1
+
         code = 0
 
         for path in paths:
@@ -2816,6 +3326,9 @@ class PostProcessApp:
             try:
                 state_data = {
                     **{k: v for k, v in result_analysis.items() if v is not None and k != "large"},
+                    "printer": printer_id,
+                    "script": str(_SCRIPT_PATH),
+                    "log_dir": str(LOG_DIR),
                     "last_path": str(path),
                     "last_export": str(export or "")
                 }
@@ -2824,6 +3337,7 @@ class PostProcessApp:
                 self.logger.log_state_warn(str(e), quiet)
 
             extra = [
+                f"printer={printer_id}",
                 f"slicer={result_analysis['slicer_time'] or '?'}",
                 f"actions={self.logger.format_actions(actions)}",
                 f"pp={int((time.monotonic() - start) * 1000)}ms",
@@ -2846,8 +3360,27 @@ class PostProcessApp:
 def run_postprocess(paths: list[Path], quiet: bool = False, force: bool = False, argv: list[str] | None = None) -> int:
     return PostProcessApp().run(paths, quiet, force, argv)
 
+def _cli_gcode_paths(argv: list[str]) -> list[Path]:
+    skip_next = False
+    paths: list[Path] = []
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in ("--printer", "-p"):
+            skip_next = True
+            continue
+        if arg.startswith("--printer="):
+            continue
+        if arg in ("--force", "-f"):
+            continue
+        if arg.startswith("-"):
+            continue
+        paths.append(Path(arg))
+    return paths
+
 if __name__ == "__main__":
     cli_argv = sys.argv[1:]
     cli_force = "--force" in cli_argv or "-f" in cli_argv
-    cli_paths = [Path(p) for p in cli_argv if not p.startswith("-")]
+    cli_paths = _cli_gcode_paths(cli_argv)
     sys.exit(PostProcessApp().run(cli_paths, quiet=True, force=cli_force, argv=cli_argv))

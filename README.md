@@ -1,16 +1,18 @@
-# E5S1 G-code Post-Process
+# E5S1 / E3 Pro G-code Post-Process
 
-G-code post-processor tuned for the **Creality Ender-5 S1** with an **0.8 mm high-flow nozzle** (Spider hotend). This is not a generic slicer profile — speed caps, fan curves, retraction, pressure advance, and skirt geometry assume this printer and nozzle size.
+G-code post-processor tuned for **Creality Ender-5 S1** or **Ender-3 Pro**, both with **0.8 mm** nozzle. This is not a generic slicer profile — speed caps, fan curves, retraction, pressure advance, and skirt geometry assume the selected printer and nozzle size.
 
 PrusaSlicer supplies sliced geometry; this pipeline injects machine-specific fan ramps, flow tuning, seam handling, pressure advance, startup repair, and adhesion skirt logic.
 
-No external config bundle is required. All tuning lives in the constant block at the top of `scripts/gcode_postprocess.py`. The optional `; prusaslicer_config` block at the end of exported G-code is read **for analysis only** (layer count, layer height, logs) — it does **not** override the hardcoded profile from `build_e5s1_profile()`.
+No external config bundle is required. Printer presets live in `scripts/gcode_postprocess.py` (`PRINTER_PRESETS`). The optional `; prusaslicer_config` block at the end of exported G-code is read **for analysis only** (layer count, layer height, logs) — it does **not** override the hardcoded profile from `build_printer_profile()`.
 
 ## Stack
 
 - Python 3.11+ (stdlib only — no third-party dependencies)
 - PrusaSlicer 2.x (`post_process` hook)
-- Target printer: **Creality Ender-5 S1**, **0.8 mm** nozzle
+- Target printers:
+  - **E5S1** (`e5s1`, default): Creality Ender-5 S1, 0.8 mm high-flow Spider, direct drive
+  - **E3 Pro** (`e3pro`): Creality Ender-3 Pro, 0.8 mm stock hotend, bowden
 - Target firmware: **Marlin** (linear advance via `M900 K`; requires `LIN_ADVANCE` enabled in firmware)
 
 ## Quick setup
@@ -24,23 +26,64 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
 In PrusaSlicer → **Print Settings → Output options → Post-processing scripts**, add:
 
+**Ender-5 S1 (default):**
+
 ```ini
 python3 /absolute/path/to/scripts/gcode_postprocess.py
 ```
 
+**Ender-3 Pro 0.8 mm** — set `GCODE_PRINTER` in the environment (wrapper script or system env):
+
+```ini
+GCODE_PRINTER=e3pro python3 /absolute/path/to/scripts/gcode_postprocess.py
+```
+
 Use the **absolute** path to `gcode_postprocess.py`. PrusaSlicer appends the `.gcode` file path as the last argument automatically — do **not** add the file path or extra flags in that field.
 
-**Important:** the in-slicer G-code preview shows the file **before** post-processing ([official docs](https://help.prusa3d.com/article/post-processing-scripts_283913)). To verify processing, open the exported `.gcode` (Downloads, SD card, etc.) in a text editor: line 3 should be `; --- E5S1 postprocess ---`.
+### Windows (PrusaSlicer)
+
+On Windows, **do not** point post-processing at the `.py` file alone — PrusaSlicer will try to run it as an executable and fail with **Win32 error 193**. Also avoid `python3` (often missing) and Linux-only syntax like `GCODE_PRINTER=e3pro python3 ...`.
+
+1. Copy `scripts/gcode_postprocess.py` and the matching `.bat` wrapper to the same folder (e.g. `C:\Users\Pichau\Documents\`).
+2. Install [Python 3.11+](https://www.python.org/downloads/) and tick **“Add python.exe to PATH”**.
+3. In PrusaSlicer → **Print Settings → Output options → Post-processing scripts**, use the **full path to the `.bat`**:
+
+**E5S1:**
+
+```ini
+C:\Users\Pichau\Documents\gcode_postprocess_e5s1.bat
+```
+
+**E3 Pro:**
+
+```ini
+C:\Users\Pichau\Documents\gcode_postprocess_e3pro.bat
+```
+
+Test in `cmd`:
+
+```bat
+py -3 C:\Users\Pichau\Documents\gcode_postprocess.py
+C:\Users\Pichau\Documents\gcode_postprocess_e5s1.bat C:\path\to\test.gcode
+```
+
+If `py` is not found, use `python` instead (the `.bat` tries both).
+
+**Logs (standalone copy):** with only `gcode_postprocess.py` in e.g. `C:\Users\Pichau\Documents\`, logs are written to `C:\Users\Pichau\Documents\logs\` (`e5s1_events.log`, `e5s1_state.json`). No repo folder required.
+
+**Important:** the in-slicer G-code preview shows the file **before** post-processing ([official docs](https://help.prusa3d.com/article/post-processing-scripts_283913)). To verify processing, open the exported `.gcode` (Downloads, SD card, etc.) in a text editor: line 3 should be `; --- E5S1 postprocess ---` or `; --- E3PRO postprocess ---` depending on the preset.
 
 ## Environment variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
+| `GCODE_PRINTER` | No | Printer preset: `e5s1` (default), `e3pro` / `ender3pro` |
+| `GCODE_POSTPROCESS_LOG_DIR` | No | Override log folder (default: `logs/` beside script, or repo `logs/` in dev) |
 | `E5S1_EXPORT_DIR` | No | Extra folder to search for recent post-processed exports (default: `~/Downloads`) |
 
 ## Tuning
 
-Edit constants at the top of `scripts/gcode_postprocess.py` (`PA_K`, `FLOW_RAMP`, `FAN_*`, `RETRACT_*`, `SEAM_*`, `SKIRT_*`, `NOZZLE_*_MM_S`, etc.). Typed contracts: `E5S1Profile`, `GcodeAnalysis`, `GcodeStats` (`TypedDict`).
+Edit constants at the top of `scripts/gcode_postprocess.py` for the E5S1 baseline, or extend `E3PRO_08_OVERRIDES` in `PRINTER_PRESETS` for the Ender-3 Pro preset (`PA_K`, `FLOW_RAMP`, `FAN_*`, `RETRACT_*`, `SEAM_*`, `SKIRT_*`, `NOZZLE_*_MM_S`, etc.). Typed contracts: `PrinterProfile` (`E5S1Profile` alias), `GcodeAnalysis`, `GcodeStats` (`TypedDict`).
 
 Linear speed caps (`NOZZLE_WALL_MM_S`, `NOZZLE_INFILL_MM_S`, etc.) are in **mm/s** and converted to G-code `F` (mm/min) via `mm_s_to_f()` — they are **not** multiplied by nozzle diameter.
 
@@ -68,6 +111,14 @@ Reprocess ignoring the idempotency marker:
 
 ```bash
 python3 scripts/gcode_postprocess.py -f /path/to/model.gcode
+```
+
+Ender-3 Pro preset (manual CLI):
+
+```bash
+GCODE_PRINTER=e3pro python3 scripts/gcode_postprocess.py /path/to/model.gcode
+# or
+python3 scripts/gcode_postprocess.py --printer e3pro /path/to/model.gcode
 ```
 
 Logs and last-run state: `logs/e5s1_events.log`, `logs/e5s1_state.json` (gitignored).
@@ -106,7 +157,7 @@ PostProcessApp.run()
 | **Startup** | `G28` if missing; `M420 S1` + `M420 Z10` after homing if no mesh/`G29`; `M190` if only `M140`; `M109` if missing; purge block if no startup extrusion; Z-fix on postprocess lines; `G90` before purge/skirt when head is in `G91` |
 | **Overhangs without support** | `max_part_cooling`: full fan PWM on overhang/perimeter features |
 | **Small perimeters** | Tiered speed on full segment — loops (circles/squares/tubes) and open walls; all layers |
-| **Perimeter seam join** | All closed loops: 96% flow on last 1.5 mm before close (external only) |
+| **Perimeter seam join** | Closed loops: join speed cap; small loops (&lt;55 mm): 105% flow + 4% E on last point; external+internal |
 | **Coast + wipe + deretract** | Coast before layer retract; 2 mm wipe after layer retract; slow deretract (`F700`) on small positive E-only moves |
 | **Travel (infill only)** | Coast/retract/boost only on long infill→infill travels (&gt; 5 mm), never on walls |
 | **Layer markers** | Normalizes `;BEFORE_LAYER_CHANGE` / `G92 E0` sync when absent |
@@ -141,7 +192,7 @@ Calibrated for **Ender-5 S1 + 0.8 mm nozzle** (constants in `gcode_postprocess.p
 | Retraction | 1.2 mm @ 50 mm/s, Z-hop 0.4 mm |
 | Skirt (if injected) | 3 loops, 40 mm side, origin (3, 3) mm |
 | Small-part skirt offset | 2.5 mm (bbox &lt; 45 mm) |
-| Seam flow / join speed | 96% at join (last 1.5 mm) / 20 mm/s close cap |
+| Seam flow / join speed | small loop: 105% + E×1.04 / 18 mm/s close cap |
 | Small loops L2+ (perimeter) | tiny &lt;30 mm → 20 / small &lt;55 → 26 mm/s; ≥55 mm → perfil rápido |
 | Small loops L1 (perimeter) | tiny &lt;35 mm → 14 / loop &lt;100 mm → 16 / open &lt;30 → 14 mm/s |
 | Mesh on start (if injected) | `M420 S1` + `M420 Z10` fade |
