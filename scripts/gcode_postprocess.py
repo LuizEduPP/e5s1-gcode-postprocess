@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""E5S1 G-code post-processor — constants, profile, transform pipeline, and CLI."""
+"""G-code post-processor — E5S1 / E3 Pro presets, transform pipeline, and CLI."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple, TypedDict
+from typing import Any, NamedTuple, TypedDict
 import heapq
 import json
 import math
@@ -229,7 +230,221 @@ Z_MOVE_F = 600
 SKIRT_TRAVEL_F = 6000
 SKIRT_EXTRUDE_F = 600
 
+ENV_GCODE_PRINTER = "GCODE_PRINTER"
 ENV_E5S1_EXPORT_DIR = "E5S1_EXPORT_DIR"
+
+TUNE_CONSTANT_NAMES: tuple[str, ...] = (
+    "BED_X_MIN",
+    "BED_X_MAX",
+    "BED_Y_MIN",
+    "BED_Y_MAX",
+    "SKIRT_OFFSET_MM",
+    "SKIRT_OFFSET_SMALL_MM",
+    "SKIRT_MIN_SIDE_MM",
+    "STARTUP_SAFE_Z_MM",
+    "SMALL_LOOP_TINY_MAX_MM",
+    "SMALL_LOOP_TINY_SPEED_MM_S",
+    "SMALL_LOOP_SMALL_MAX_MM",
+    "SMALL_LOOP_SMALL_SPEED_MM_S",
+    "SMALL_OPEN_MAX_MM",
+    "SMALL_OPEN_SPEED_MM_S",
+    "FIRST_LAYER_LOOP_MAX_MM",
+    "FIRST_LAYER_LOOP_TINY_MAX_MM",
+    "FIRST_LAYER_LOOP_TINY_SPEED_MM_S",
+    "FIRST_LAYER_LOOP_SPEED_MM_S",
+    "FIRST_LAYER_SMALL_OPEN_MAX_MM",
+    "FIRST_LAYER_SMALL_OPEN_SPEED_MM_S",
+    "FIRST_LAYER_REPAIR_MAX_LAYER",
+    "SEAM_JOIN_FLOW_MM",
+    "SEAM_JOIN_FLOW_SMALL_MM",
+    "SKIRT_OFFSET_SMALL_BBOX_MM",
+    "COAST_E_MM",
+    "LAYER_RETRACT_WIPE_MM",
+    "LAYER_RETRACT_WIPE_E_MM",
+    "TRAVEL_COAST_MIN_MM",
+    "TRAVEL_RETRACT_MM",
+    "TRAVEL_START_BOOST_PCT",
+    "TRAVEL_START_BOOST_MM",
+    "DERETRACT_F",
+    "DERETRACT_MAX_E_MM",
+    "SLICER_DERETRACT_MAX_E_MM",
+    "FIRST_LAYER_INTERNAL_WALL_FACTOR",
+    "FIRST_LAYER_INFILL_FACTOR",
+    "PA_K",
+    "NOZZLE_DIAMETER_MM",
+    "LAYER_HEIGHT_FIRST_MM",
+    "TEMP_FIRST_LAYER_C",
+    "MAX_VOLUMETRIC_FLOW_MM3_S",
+    "RETRACT_LENGTH_MM",
+    "RETRACT_SPEED_MM_S",
+    "RETRACT_LIFT_MM",
+    "FAN_OFF_LAYERS",
+    "FAN_RAMP_LAYERS",
+    "FAN_MIN_PCT",
+    "FAN_MAX_PCT",
+    "FAN_BRIDGE_PCT",
+    "FAN_OVERHANG_PCT",
+    "FAN_TOP_PCT",
+    "FAN_IRONING_PCT",
+    "FAN_INTERFACE_PCT",
+    "FAN_SUPPORT_PCT",
+    "FLOW_RAMP",
+    "FLOW_BRIDGE_PCT",
+    "NOZZLE_EXTERNAL_MM_S",
+    "NOZZLE_WALL_MM_S",
+    "NOZZLE_INFILL_MM_S",
+    "NOZZLE_CAP_MM_S",
+    "NOZZLE_TRAVEL_MM_S",
+    "SPEED_FIRST_LAYER_MM_S",
+    "SPEED_MAX_PRINT_MM_S",
+    "ACCEL_FIRST_LAYER",
+    "ACCEL_DEFAULT",
+    "LAYER_CAP_EXTRUSION",
+    "LAYER_FIRST_MOTION",
+    "SEAM_EXTRA_RETRACT_MM",
+    "SEAM_FLOW_PCT",
+    "SEAM_FLOW_SMALL_PCT",
+    "SEAM_JOIN_E_BOOST_RATIO",
+    "SEAM_FAN_PCT",
+    "SEAM_JOIN_SPEED_MM_S",
+    "EXTRA_DERETRACT_RESTART_MM",
+    "EXTRA_DERETRACT_TINY_MM",
+    "FIRST_LAYER_EXTRA_RESTART_MM",
+    "FIRST_LAYER_EXTRA_TINY_MM",
+    "FIRST_LAYER_SEAM_JOIN_E_BOOST_RATIO",
+    "FIRST_LAYER_SEAM_FLOW_SMALL_PCT",
+    "SKIRT_LOOPS",
+    "SKIRT_SIDE_MM",
+    "SKIRT_ORIGIN_X_MM",
+    "SKIRT_ORIGIN_Y_MM",
+    "SKIRT_LOOP_OFFSET_MM",
+    "SKIRT_EXTRUSION_MM_PER_MM",
+    "PURGE_X_START",
+    "PURGE_X_SECOND",
+    "PURGE_Y_START",
+    "PURGE_Y_END",
+    "PURGE_TRAVEL_F",
+    "PURGE_Z_F",
+    "PURGE_EXTRUDE_F",
+    "PURGE_E_FACTOR",
+    "PURGE_NOZZLE_MULT",
+    "PURGE_E_DIVISOR",
+    "PURGE_E_SECOND_MULT",
+)
+
+
+@dataclass(frozen=True)
+class PrinterPreset:
+    printer_id: str
+    marker: str
+    overrides: dict[str, Any]
+
+
+E3PRO_08_OVERRIDES: dict[str, Any] = {
+    "RETRACT_LENGTH_MM": 5.0,
+    "RETRACT_SPEED_MM_S": 45.0,
+    "RETRACT_LIFT_MM": 0.2,
+    "PA_K": 0.055,
+    "MAX_VOLUMETRIC_FLOW_MM3_S": 14.0,
+    "SLICER_DERETRACT_MAX_E_MM": 5.5,
+    "DERETRACT_MAX_E_MM": 0.45,
+    "TRAVEL_RETRACT_MM": 1.2,
+    "COAST_E_MM": 0.40,
+    "NOZZLE_EXTERNAL_MM_S": 32.0,
+    "NOZZLE_WALL_MM_S": 38.0,
+    "NOZZLE_INFILL_MM_S": 55.0,
+    "NOZZLE_CAP_MM_S": 28.0,
+    "NOZZLE_TRAVEL_MM_S": 120.0,
+    "SPEED_FIRST_LAYER_MM_S": 18.0,
+    "SPEED_MAX_PRINT_MM_S": 120.0,
+    "ACCEL_FIRST_LAYER": 500,
+    "ACCEL_DEFAULT": 1200,
+    "FAN_MIN_PCT": 90,
+    "SMALL_LOOP_TINY_SPEED_MM_S": 16.0,
+    "SMALL_LOOP_SMALL_SPEED_MM_S": 20.0,
+    "FIRST_LAYER_LOOP_TINY_SPEED_MM_S": 12.0,
+    "FIRST_LAYER_LOOP_SPEED_MM_S": 14.0,
+    "SEAM_JOIN_SPEED_MM_S": 15.0,
+    "SEAM_EXTRA_RETRACT_MM": 0.6,
+    "EXTRA_DERETRACT_RESTART_MM": 0.10,
+    "EXTRA_DERETRACT_TINY_MM": 0.12,
+    "FIRST_LAYER_EXTRA_RESTART_MM": 0.14,
+    "FIRST_LAYER_EXTRA_TINY_MM": 0.16,
+    "TEMP_FIRST_LAYER_C": "210",
+    "PURGE_Y_END": 175.0,
+}
+
+PRINTER_PRESETS: dict[str, PrinterPreset] = {
+    "e5s1": PrinterPreset("e5s1", "; --- E5S1 postprocess ---", {}),
+    "e3pro": PrinterPreset("e3pro", "; --- E3PRO postprocess ---", E3PRO_08_OVERRIDES),
+}
+
+ALL_POSTPROCESS_MARKERS: tuple[str, ...] = tuple(
+    dict.fromkeys(p.marker for p in PRINTER_PRESETS.values())
+)
+
+_PRINTER_ALIASES: dict[str, str] = {
+    "e5s1": "e5s1",
+    "ender5s1": "e5s1",
+    "e3pro": "e3pro",
+    "ender3pro": "e3pro",
+    "e3pro08": "e3pro",
+}
+
+_MODULE_DEFAULTS: dict[str, Any] = {name: globals()[name] for name in TUNE_CONSTANT_NAMES}
+_MODULE_DEFAULT_MARKER = MARKER
+_ACTIVE_PRINTER_ID = "e5s1"
+
+
+def _recompute_derived_constants() -> None:
+    global FAN_FULL_LAYER, LOOP_NEAR_CLOSE_TOL_MM, MARKER_HEAD_BYTES
+    FAN_FULL_LAYER = FAN_OFF_LAYERS + FAN_RAMP_LAYERS + 1
+    LOOP_NEAR_CLOSE_TOL_MM = NOZZLE_DIAMETER_MM * 0.15 + LOOP_CLOSE_TOL_MM
+    MARKER_HEAD_BYTES = max(MARKER_HEAD_MIN_BYTES, len(MARKER) + 64)
+
+
+def _normalize_printer_id(raw: str) -> str:
+    key = raw.strip().lower().replace("_", "").replace("-", "")
+    if key in PRINTER_PRESETS:
+        return key
+    for alias, printer_id in _PRINTER_ALIASES.items():
+        if key == alias.replace("_", "").replace("-", ""):
+            return printer_id
+    known = ", ".join(sorted(PRINTER_PRESETS))
+    raise ValueError(f"unknown printer {raw!r}; choose from {known}")
+
+
+def resolve_printer_id(argv: list[str] | None = None) -> str:
+    if argv:
+        for i, arg in enumerate(argv):
+            if arg in ("--printer", "-p") and i + 1 < len(argv):
+                return _normalize_printer_id(argv[i + 1])
+            if arg.startswith("--printer="):
+                return _normalize_printer_id(arg.split("=", 1)[1])
+    env = os.environ.get(ENV_GCODE_PRINTER, "").strip()
+    if env:
+        return _normalize_printer_id(env)
+    return "e5s1"
+
+
+def activate_printer(printer_id: str) -> str:
+    """Apply printer preset overrides to module-level tuning constants."""
+    global MARKER, _ACTIVE_PRINTER_ID
+    pid = _normalize_printer_id(printer_id)
+    preset = PRINTER_PRESETS[pid]
+    values = dict(_MODULE_DEFAULTS)
+    values.update(preset.overrides)
+    for name, value in values.items():
+        globals()[name] = value
+    MARKER = preset.marker
+    _ACTIVE_PRINTER_ID = pid
+    _recompute_derived_constants()
+    return pid
+
+
+def active_printer_id() -> str:
+    return _ACTIVE_PRINTER_ID
+
 EXPORT_FOLDER_NAMES = ("Downloads")
 EXPORT_MAX_AGE_S = 300
 EXPORT_MAX_FILES = 5
@@ -307,6 +522,8 @@ class E5S1Profile(TypedDict):
     first_layer_temperature_c: str
     nozzle_diameter_mm: float
     max_volumetric_flow: float
+
+PrinterProfile = E5S1Profile
 
 class GcodeAnalysis(TypedDict):
     overhang_markers: int
@@ -418,8 +635,8 @@ def parse_prusa_config(text: str) -> dict[str, str]:
         out[key.strip()] = val.strip()
     return _merge_custom_parameters(out)
 
-def build_e5s1_profile() -> E5S1Profile:
-    """Perfil E5S1 calibrado — sempre hardcoded; ignora bundle e config do slicer."""
+def build_printer_profile() -> PrinterProfile:
+    """Perfil calibrado da impressora ativa — sempre hardcoded; ignora bundle e config do slicer."""
     return {
         "retract_mm": RETRACT_LENGTH_MM,
         "retract_f": mm_s_to_f(RETRACT_SPEED_MM_S),
@@ -463,6 +680,9 @@ def build_e5s1_profile() -> E5S1Profile:
         "nozzle_diameter_mm": NOZZLE_DIAMETER_MM,
         "max_volumetric_flow": MAX_VOLUMETRIC_FLOW_MM3_S,
     }
+
+def build_e5s1_profile() -> E5S1Profile:
+    return build_printer_profile()
 
 def _axis_float(match: re.Match[str] | None) -> float | None:
     if not match:
@@ -954,7 +1174,7 @@ class GCodeAnalyzer:
         return overhang_markers >= SUPPORT_OVERHANG_MIN and not has_support
 
     def is_postprocessed(self, text: str) -> bool:
-        return MARKER in text
+        return any(marker in text for marker in ALL_POSTPROCESS_MARKERS)
 
     def count_pp_fan_lines(self, text: str) -> int:
         return len(PP_FAN_RE.findall(text))
@@ -2799,7 +3019,7 @@ def transform_gcode(
     analysis: GcodeAnalysis,
     prusa_cfg: dict[str, str] | None = None,
 ) -> tuple[list[str], list[str]]:
-    profile = build_e5s1_profile()
+    profile = build_printer_profile()
     pa_fw = PA_FIRMWARE
     need_sup = analysis["needs_support"]
     skip_overhang_fan = analysis["large"] and analysis["overhang_markers"] > OVERHANG_FAN_SKIP_THRESHOLD and not need_sup
@@ -2925,7 +3145,8 @@ class RecentExportFinder:
             for candidate in self._recent_gcode_candidates(folder, now, max_age_s, max_files, warnings):
                 try:
                     with candidate.open(encoding="utf-8", errors="replace") as f:
-                        if MARKER in f.read(MARKER_HEAD_BYTES):
+                        head = f.read(MARKER_HEAD_BYTES)
+                        if any(marker in head for marker in ALL_POSTPROCESS_MARKERS):
                             return candidate, warnings
                 except OSError as exc:
                     warnings.append(f"export read failed {candidate}: {exc}")
@@ -3027,6 +3248,12 @@ class PostProcessApp:
             self.logger = logger
 
     def run(self, paths: list[Path], quiet: bool = False, force: bool = False, argv: list[str] | None = None) -> int:
+        try:
+            printer_id = activate_printer(resolve_printer_id(argv))
+        except ValueError as exc:
+            self.logger.log_fail(str(exc), quiet)
+            return 1
+
         code = 0
 
         for path in paths:
@@ -3086,6 +3313,7 @@ class PostProcessApp:
                 self.logger.log_state_warn(str(e), quiet)
 
             extra = [
+                f"printer={printer_id}",
                 f"slicer={result_analysis['slicer_time'] or '?'}",
                 f"actions={self.logger.format_actions(actions)}",
                 f"pp={int((time.monotonic() - start) * 1000)}ms",
@@ -3108,8 +3336,27 @@ class PostProcessApp:
 def run_postprocess(paths: list[Path], quiet: bool = False, force: bool = False, argv: list[str] | None = None) -> int:
     return PostProcessApp().run(paths, quiet, force, argv)
 
+def _cli_gcode_paths(argv: list[str]) -> list[Path]:
+    skip_next = False
+    paths: list[Path] = []
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in ("--printer", "-p"):
+            skip_next = True
+            continue
+        if arg.startswith("--printer="):
+            continue
+        if arg in ("--force", "-f"):
+            continue
+        if arg.startswith("-"):
+            continue
+        paths.append(Path(arg))
+    return paths
+
 if __name__ == "__main__":
     cli_argv = sys.argv[1:]
     cli_force = "--force" in cli_argv or "-f" in cli_argv
-    cli_paths = [Path(p) for p in cli_argv if not p.startswith("-")]
+    cli_paths = _cli_gcode_paths(cli_argv)
     sys.exit(PostProcessApp().run(cli_paths, quiet=True, force=cli_force, argv=cli_argv))
