@@ -161,6 +161,7 @@ FLOW_NORMAL_PCT = 100
 MM_S_TO_F = 60
 
 NOZZLE_DIAMETER_MM = 0.8
+LOOP_NEAR_CLOSE_TOL_MM = NOZZLE_DIAMETER_MM * 0.15 + LOOP_CLOSE_TOL_MM
 LAYER_HEIGHT_FIRST_MM = 0.24
 TEMP_FIRST_LAYER_C = "215"
 MAX_VOLUMETRIC_FLOW_MM3_S = 30.0
@@ -181,7 +182,7 @@ FAN_IRONING_PCT = 35
 FAN_INTERFACE_PCT = 78
 FAN_SUPPORT_PCT = 78
 
-FLOW_RAMP = (100, 97, 98, 100)
+FLOW_RAMP = (100, 100, 98, 100)
 FLOW_BRIDGE_PCT = 95
 NOZZLE_EXTERNAL_MM_S = 52
 NOZZLE_WALL_MM_S = 62
@@ -202,6 +203,13 @@ SEAM_FLOW_SMALL_PCT = 105
 SEAM_JOIN_E_BOOST_RATIO = 1.04
 SEAM_FAN_PCT = 85
 SEAM_JOIN_SPEED_MM_S = 18.0
+EXTRA_DERETRACT_RESTART_MM = 0.08
+EXTRA_DERETRACT_TINY_MM = 0.10
+FIRST_LAYER_EXTRA_RESTART_MM = 0.12
+FIRST_LAYER_EXTRA_TINY_MM = 0.14
+FIRST_LAYER_SEAM_JOIN_E_BOOST_RATIO = 1.07
+FIRST_LAYER_SEAM_FLOW_SMALL_PCT = 108
+EXTRA_DERETRACT_LOOKBACK = 48
 
 SKIRT_LOOPS = 3
 SKIRT_SIDE_MM = 40.0
@@ -514,6 +522,18 @@ def _join_boost_e_on_line(line: str, ratio: float) -> str | None:
     new_e = e_val * ratio
     return E_VAL_RE.sub(f"E{new_e:.5f}", line, count=1)
 
+def _add_e_on_line(line: str, extra_mm: float, *, comment: str = "postprocess extra restart") -> str | None:
+    m = E_VAL_RE.search(line)
+    if not m:
+        return None
+    e_val = float(m.group(1))
+    if e_val <= 0:
+        return None
+    new_e = e_val + extra_mm
+    head = line.split(";", 1)[0]
+    head = E_VAL_RE.sub(f"E{new_e:.5f}", head, count=1)
+    return f"{head.rstrip()} ; {comment}"
+
 def _coast_blocked_before_travel(lines: list[str], ext_i: int, travel_i: int) -> bool:
     for j in range(ext_i + 1, travel_i):
         low = lines[j].lower()
@@ -740,6 +760,9 @@ class GCodeBuilder:
 
     def seam_extra_retract(self, mm: float, retract_f: int) -> str:
         return f"G1 E-{mm} F{retract_f} ; postprocess seam extra retract"
+
+    def extra_deretract_restart(self, mm: float, deretract_f: int = DERETRACT_F) -> str:
+        return f"G1 E{mm:.5f} F{deretract_f} ; postprocess extra restart"
 
     def z_hop(self, mm: float) -> str:
         return f"G91\nG1 Z{mm} F{Z_HOP_F} ; postprocess z hop\nG90"
@@ -1523,6 +1546,71 @@ def _segment_closed(region: list[str], seg: list[int]) -> bool:
         return False
     return math.hypot(lx - sx, ly - sy) <= LOOP_CLOSE_TOL_MM
 
+def _segment_nearly_closed(
+    region: list[str],
+    seg: list[int],
+    *,
+    tol_mm: float = LOOP_NEAR_CLOSE_TOL_MM,
+) -> bool:
+    sx = sy = lx = ly = None
+    for idx in seg:
+        upper = region[idx].upper()
+        if not upper.startswith(("G0", "G1", "G2", "G3")):
+            continue
+        m_x, m_y = X_VAL_RE.search(upper), Y_VAL_RE.search(upper)
+        x, y = _axis_float(m_x), _axis_float(m_y)
+        if x is None or y is None:
+            continue
+        if sx is None:
+            sx, sy = x, y
+        lx, ly = x, y
+    if sx is None or lx is None:
+        return False
+    return math.hypot(lx - sx, ly - sy) <= tol_mm
+
+def _segment_is_loop(region: list[str], seg: list[int], closed: bool) -> bool:
+    if closed:
+        return True
+    return _segment_nearly_closed(region, seg)
+
+def _extra_restart_loop_max(layer: int) -> float:
+    if layer <= FIRST_LAYER_REPAIR_MAX_LAYER:
+        return FIRST_LAYER_LOOP_MAX_MM
+    return SEAM_FLOW_SMALL_LOOP_MAX_MM
+
+def _extra_restart_amount(layer: int, dist: float) -> float:
+    tiny = dist < SMALL_LOOP_TINY_MAX_MM
+    if layer <= FIRST_LAYER_REPAIR_MAX_LAYER:
+        return FIRST_LAYER_EXTRA_TINY_MM if tiny else FIRST_LAYER_EXTRA_RESTART_MM
+    return EXTRA_DERETRACT_TINY_MM if tiny else EXTRA_DERETRACT_RESTART_MM
+
+def _needs_loop_start_prime(
+    region: list[str],
+    seg: list[int],
+    closed: bool,
+    layer: int,
+    wall_start: int,
+) -> bool:
+    if layer <= FIRST_LAYER_REPAIR_MAX_LAYER and _segment_is_loop(region, seg, closed):
+        return True
+    if layer <= FIRST_LAYER_REPAIR_MAX_LAYER and not _segment_is_loop(region, seg, closed):
+        dist = 0.0
+        last_x = last_y = None
+        for idx in seg:
+            step, x, y = _motion_step_mm(region[idx], last_x, last_y)
+            if step > 0:
+                dist += step
+            if x is not None:
+                last_x = x
+            if y is not None:
+                last_y = y
+        if dist < FIRST_LAYER_SMALL_OPEN_MAX_MM and _approach_prime_needed(region, wall_start):
+            return True
+    return (
+        _loop_had_retract_before(region, wall_start)
+        or _approach_prime_needed(region, wall_start)
+    )
+
 def _collect_perimeter_segments(
     region: list[str],
 ) -> list[tuple[list[int], float, int, bool, str]]:
@@ -1640,21 +1728,35 @@ def repair_perimeter_seam_join(
     joined = 0
     flow_joined = 0
 
-    for seg, dist, _layer, closed, kind in _collect_perimeter_segments(region):
-        if not closed or not seg:
+    for seg, dist, layer, closed, kind in _collect_perimeter_segments(region):
+        if not _segment_is_loop(region, seg, closed) or not seg:
             continue
         i1 = seg[-1]
+        join_f = profile["seam_join_f"]
+        first_layer = layer <= FIRST_LAYER_REPAIR_MAX_LAYER
+        loop_max = _extra_restart_loop_max(layer)
+        small_loop = dist < loop_max
         join_line = cap_f_line(region[i1], join_f, join_f, builder)[0]
-        small_loop = dist < SEAM_FLOW_SMALL_LOOP_MAX_MM
         if small_loop and kind in FEAT_PERIMETER:
-            boosted = _join_boost_e_on_line(join_line, SEAM_JOIN_E_BOOST_RATIO)
+            boost_ratio = (
+                FIRST_LAYER_SEAM_JOIN_E_BOOST_RATIO
+                if first_layer
+                else SEAM_JOIN_E_BOOST_RATIO
+            )
+            boosted = _join_boost_e_on_line(join_line, boost_ratio)
             if boosted:
-                join_line = boosted + " ; postprocess loop close e boost"
+                tag = "first layer loop close e boost" if first_layer else "postprocess loop close e boost"
+                join_line = boosted + f" ; {tag}"
         overrides[i1] = join_line + " ; postprocess loop close cap"
         joined += 1
         if kind in FEAT_PERIMETER:
             join_mm = SEAM_JOIN_FLOW_SMALL_MM if small_loop else SEAM_JOIN_FLOW_MM
-            flow_pct = SEAM_FLOW_SMALL_PCT if small_loop else seam_flow
+            if small_loop and first_layer:
+                flow_pct = FIRST_LAYER_SEAM_FLOW_SMALL_PCT
+            elif small_loop:
+                flow_pct = SEAM_FLOW_SMALL_PCT
+            else:
+                flow_pct = seam_flow
             if flow_pct != FLOW_NORMAL_PCT:
                 cum = _segment_cumulative_dist(region, seg)
                 join_start = next((idx for idx, d in cum if dist - d <= join_mm), None)
@@ -1698,7 +1800,7 @@ def repair_small_perimeter_speed(
     for seg, dist, layer, closed, _kind in _collect_perimeter_segments(region):
         if not seg:
             continue
-        cap = _small_perimeter_speed_cap(layer, dist, closed)
+        cap = _small_perimeter_speed_cap(layer, dist, _segment_is_loop(region, seg, closed))
         if cap is None:
             continue
         cap_f, comment = cap
@@ -1993,6 +2095,190 @@ def _after_layer_travel(lines: list[str], idx: int, lookback: int = 20) -> bool:
                 return False
     return False
 
+def _segment_wall_start(region: list[str], seg: list[int]) -> int:
+    for idx in seg:
+        stripped = region[idx].strip()
+        if not G1_EXTRUDE_RE.match(stripped):
+            continue
+        m = E_VAL_RE.search(stripped.upper())
+        if not m or float(m.group(1)) <= 0:
+            continue
+        if X_VAL_RE.search(stripped) or Y_VAL_RE.search(stripped):
+            return idx
+    return seg[0]
+
+def _approach_prime_needed(
+    region: list[str],
+    wall_start: int,
+    *,
+    lookback: int = EXTRA_DERETRACT_LOOKBACK,
+) -> bool:
+    """True when the loop starts after a travel from another feature (e.g. square wall → hole circle)."""
+    traveled = False
+    for j in range(wall_start - 1, max(wall_start - lookback, -1), -1):
+        if any(m in region[j] for m in LAYER_MARKERS):
+            return False
+        stripped = region[j].strip()
+        upper = stripped.upper()
+        if G1_EXTRUDE_RE.match(stripped):
+            m = E_VAL_RE.search(upper)
+            if m and float(m.group(1)) > 0:
+                if X_VAL_RE.search(stripped) or Y_VAL_RE.search(stripped):
+                    return traveled
+                continue
+        if upper.startswith(("G0", "G1")) and (
+            X_VAL_RE.search(stripped) or Y_VAL_RE.search(stripped)
+        ):
+            m = E_VAL_RE.search(upper)
+            if m is None or float(m.group(1)) <= 0:
+                traveled = True
+    return traveled
+
+def _loop_had_retract_before(
+    region: list[str],
+    wall_start: int,
+    *,
+    lookback: int = EXTRA_DERETRACT_LOOKBACK,
+) -> bool:
+    for j in range(wall_start - 1, max(wall_start - lookback, -1), -1):
+        stripped = region[j].strip()
+        if any(m in region[j] for m in LAYER_MARKERS):
+            return False
+        if RETRACT_RE.match(stripped):
+            return True
+        feat = type_feature(region[j])
+        if feat is not None and feat not in FEAT_PERIMETER:
+            return False
+        if G1_EXTRUDE_RE.match(stripped):
+            m = E_VAL_RE.search(stripped.upper())
+            if m and float(m.group(1)) > 0 and (
+                X_VAL_RE.search(stripped) or Y_VAL_RE.search(stripped)
+            ):
+                return False
+    return False
+
+def _loop_restart_deretract_idx(
+    region: list[str],
+    wall_start: int,
+    *,
+    lookback: int = EXTRA_DERETRACT_LOOKBACK,
+) -> int | None:
+    retract_idx: int | None = None
+    for j in range(wall_start - 1, max(wall_start - lookback, -1), -1):
+        line = region[j]
+        low = line.lower()
+        if "postprocess extra restart" in low:
+            return None
+        if any(m in line for m in LAYER_MARKERS):
+            return None
+        stripped = line.strip()
+        feat = type_feature(line)
+        if feat is not None and feat not in FEAT_PERIMETER:
+            return None
+        m = E_VAL_RE.search(stripped.upper()) if G1_EXTRUDE_RE.match(stripped) else None
+        e_val = float(m.group(1)) if m else None
+        if RETRACT_RE.match(stripped) or (e_val is not None and e_val < 0):
+            retract_idx = j
+            break
+        if e_val is not None and e_val > 0 and (
+            X_VAL_RE.search(stripped) or Y_VAL_RE.search(stripped)
+        ):
+            return None
+    if retract_idx is None:
+        return None
+    for k in range(retract_idx + 1, wall_start):
+        line = region[k]
+        if "postprocess extra restart" in line.lower():
+            return None
+        stripped = line.strip()
+        if not G1_EXTRUDE_RE.match(stripped):
+            continue
+        m = E_VAL_RE.search(stripped.upper())
+        if m and float(m.group(1)) > 0:
+            return k
+    return None
+
+def repair_extra_deretract_restart(
+    lines: list[str],
+    builder: GCodeBuilder,
+    actions: list[str],
+    *,
+    body_start: int | None = None,
+) -> list[str]:
+    """Extra material at loop start after travel/retract (hole circles, seam_gap loops)."""
+    start = body_start if body_start is not None else head_index(lines)
+    region = lines[start:]
+    overrides: dict[int, str] = {}
+    boosted = 0
+    wall_primed = 0
+    touched: set[int] = set()
+
+    for seg, dist, layer, closed, kind in _collect_perimeter_segments(region):
+        if not seg:
+            continue
+        loop_like = _segment_is_loop(region, seg, closed)
+        if loop_like and dist >= _extra_restart_loop_max(layer):
+            continue
+        if not loop_like:
+            if layer > FIRST_LAYER_REPAIR_MAX_LAYER or kind not in FEAT_PERIMETER:
+                continue
+            if dist >= FIRST_LAYER_SMALL_OPEN_MAX_MM:
+                continue
+        extra = _extra_restart_amount(layer, dist)
+        wall_start = _segment_wall_start(region, seg)
+        if "postprocess extra restart" in region[wall_start].lower():
+            continue
+        if "postprocess loop start prime" in region[wall_start].lower():
+            continue
+        if "first layer loop start prime" in region[wall_start].lower():
+            continue
+
+        retract_idx = _loop_restart_deretract_idx(region, wall_start)
+        if retract_idx is not None and retract_idx not in touched:
+            new_line = _add_e_on_line(region[retract_idx], extra)
+            if new_line:
+                overrides[retract_idx] = new_line
+                touched.add(retract_idx)
+                boosted += 1
+            continue
+
+        if not _needs_loop_start_prime(region, seg, closed, layer, wall_start):
+            continue
+        if wall_start in touched:
+            continue
+        first_layer = layer <= FIRST_LAYER_REPAIR_MAX_LAYER
+        if first_layer:
+            comment = "first layer loop start prime"
+        elif _loop_had_retract_before(region, wall_start):
+            comment = "postprocess extra restart"
+        else:
+            comment = "postprocess loop start prime"
+        new_line = _add_e_on_line(region[wall_start], extra, comment=comment)
+        if new_line:
+            overrides[wall_start] = new_line
+            touched.add(wall_start)
+            wall_primed += 1
+
+    if not boosted and not wall_primed:
+        return lines
+
+    out = list(region)
+    for idx in sorted(overrides, reverse=True):
+        out[idx] = overrides[idx]
+    parts: list[str] = []
+    if boosted:
+        parts.append(f"boost×{boosted}")
+    if wall_primed:
+        parts.append(f"wall×{wall_primed}")
+    l1 = sum(
+        1 for idx in overrides
+        if "first layer loop start prime" in overrides[idx].lower()
+    )
+    if l1:
+        parts.append(f"l1×{l1}")
+    actions.append(f"extra_restart_{','.join(parts)}")
+    return lines[:start] + out
+
 def _slow_deretract_line(
     out: list[str],
     idx: int,
@@ -2012,13 +2298,26 @@ def _slow_deretract_line(
     out[idx] = f"{head} ; postprocess deretract slow"
     return True
 
+def _deretract_slow_max_e(line: str) -> float:
+    if "postprocess extra restart" in line.lower() or "loop start prime" in line.lower():
+        return SLICER_DERETRACT_MAX_E_MM + FIRST_LAYER_EXTRA_TINY_MM
+    return SLICER_DERETRACT_MAX_E_MM
+
 def repair_deretract(lines: list[str], actions: list[str]) -> list[str]:
     out = list(lines)
     slowed = 0
     i = 0
     while i < len(out):
         low = out[i].lower()
-        if "postprocess" in low and "e-" in low and RETRACT_RE.match(out[i].strip()):
+        if "postprocess extra restart" in low or "loop start prime" in low:
+            max_e = (
+                FIRST_LAYER_EXTRA_TINY_MM
+                if "first layer loop start prime" in low
+                else EXTRA_DERETRACT_TINY_MM
+            )
+            if _slow_deretract_line(out, i, max_e=max_e):
+                slowed += 1
+        elif "postprocess" in low and "e-" in low and RETRACT_RE.match(out[i].strip()):
             for j in range(i + 1, min(i + 16, len(out))):
                 stripped = out[j].strip()
                 if not G1_EXTRUDE_RE.match(stripped):
@@ -2036,7 +2335,7 @@ def repair_deretract(lines: list[str], actions: list[str]) -> list[str]:
                     and not _active_wall_feature(out, i)))
                 and not _after_layer_travel(out, i)
                 and not _near_layer_start(out, i)) and _slow_deretract_line(
-            out, i, max_e=SLICER_DERETRACT_MAX_E_MM,
+            out, i, max_e=_deretract_slow_max_e(out[i]),
         ):
             slowed += 1
         i += 1
@@ -2619,6 +2918,7 @@ def transform_gcode(
     out = repair_travel_coast(out, repair_actions)
     out = repair_travel_retract(out, profile, builder, repair_actions)
     out = repair_travel_start_boost(out, builder, repair_actions)
+    out = repair_extra_deretract_restart(out, builder, repair_actions, body_start=body_start)
     out = repair_deretract(out, repair_actions)
     out = repair_stale_layer_wipe(out, repair_actions)
     out = repair_stale_layer_gap(out, repair_actions)
