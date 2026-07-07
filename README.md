@@ -1,19 +1,19 @@
 # E5S1 G-code Post-Process
 
-Pós-processador de G-code calibrado para a **Creality Ender-5 S1** com bico **0.8 mm high-flow** (hotend Spider). Não é um perfil genérico de fatiador — limites de velocidade, curvas de ventoinha, retração, pressure advance e geometria de saia assumem esta impressora e este diâmetro de bico.
+G-code post-processor tuned for the **Creality Ender-5 S1** with an **0.8 mm high-flow nozzle** (Spider hotend). This is not a generic slicer profile — speed caps, fan curves, retraction, pressure advance, and skirt geometry assume this printer and nozzle size.
 
-O PrusaSlicer fornece a geometria fatiada; este pipeline injeta rampas de fan, ajuste de fluxo, tratamento de costura, PA, reparo de startup e saia de adesão específicos da máquina.
+PrusaSlicer supplies sliced geometry; this pipeline injects machine-specific fan ramps, flow tuning, seam handling, pressure advance, startup repair, and adhesion skirt logic.
 
-Nenhuma config externa é necessária — todo o tuning está no bloco de constantes no topo de `scripts/gcode_postprocess.py`. Edite esses valores para alterar o comportamento. O bloco opcional `; prusaslicer_config` no final do G-code é lido **somente para análise** (contagem de camadas, layer height, logs) — **não** sobrescreve o perfil hardcoded.
+No external config bundle is required. All tuning lives in the constant block at the top of `scripts/gcode_postprocess.py`. The optional `; prusaslicer_config` block at the end of exported G-code is read **for analysis only** (layer count, layer height, logs) — it does **not** override the hardcoded profile from `build_e5s1_profile()`.
 
 ## Stack
 
-- Python 3.11+ (stdlib only — sem dependências de terceiros)
-- PrusaSlicer 2.x (hook `post_process`)
-- Impressora alvo: **Creality Ender-5 S1**, bico **0.8 mm**
-- Firmware alvo: **Marlin** (linear advance via `M900 K`)
+- Python 3.11+ (stdlib only — no third-party dependencies)
+- PrusaSlicer 2.x (`post_process` hook)
+- Target printer: **Creality Ender-5 S1**, **0.8 mm** nozzle
+- Target firmware: **Marlin** (linear advance via `M900 K`; requires `LIN_ADVANCE` enabled in firmware)
 
-## Setup rápido
+## Quick setup
 
 ```bash
 git clone https://github.com/LuizEduPP/e5s1-gcode-postprocess.git
@@ -22,25 +22,31 @@ python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 ```
 
-No PrusaSlicer → **Print Settings → Output options → Post-processing scripts**, adicione:
+In PrusaSlicer → **Print Settings → Output options → Post-processing scripts**, add:
 
 ```ini
-python3 /caminho/absoluto/para/scripts/gcode_postprocess.py
+python3 /absolute/path/to/scripts/gcode_postprocess.py
 ```
 
-Use o caminho absoluto para `gcode_postprocess.py`. O PrusaSlicer passa o caminho do G-code exportado como primeiro argumento a cada fatiamento.
+Use the **absolute** path to `gcode_postprocess.py`. PrusaSlicer appends the `.gcode` file path as the last argument automatically — do **not** add the file path or extra flags in that field.
 
-## Variáveis de ambiente
+**Important:** the in-slicer G-code preview shows the file **before** post-processing ([official docs](https://help.prusa3d.com/article/post-processing-scripts_283913)). To verify processing, open the exported `.gcode` (Downloads, SD card, etc.) in a text editor: line 3 should be `; --- E5S1 postprocess ---`.
 
-| Variável | Obrigatória | Descrição |
-|----------|-------------|-----------|
-| `E5S1_EXPORT_DIR` | Não | Pasta extra para buscar exports recentes pós-processados (padrão: `~/Downloads`, `~/Documents`, `~/Documentos`) |
+## Environment variables
 
-Tuning da Ender-5 S1 / 0.8 mm: constantes no topo de `scripts/gcode_postprocess.py` (`PA_K`, `FLOW_RAMP`, `FAN_*`, `RETRACT_*`, `SEAM_*`, `SKIRT_*`, etc.). Contratos tipados: `E5S1Profile`, `GcodeAnalysis`, `GcodeStats` (`TypedDict`).
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `E5S1_EXPORT_DIR` | No | Extra folder to search for recent post-processed exports (default: `~/Downloads`, `~/Documents`, `~/Documentos`) |
 
-## Comandos
+## Tuning
 
-Pós-processar um ou mais arquivos manualmente (saída verbosa):
+Edit constants at the top of `scripts/gcode_postprocess.py` (`PA_K`, `FLOW_RAMP`, `FAN_*`, `RETRACT_*`, `SEAM_*`, `SKIRT_*`, `NOZZLE_*_MM_S`, etc.). Typed contracts: `E5S1Profile`, `GcodeAnalysis`, `GcodeStats` (`TypedDict`).
+
+Linear speed caps (`NOZZLE_WALL_MM_S`, `NOZZLE_INFILL_MM_S`, etc.) are in **mm/s** and converted to G-code `F` (mm/min) via `mm_s_to_f()` — they are **not** multiplied by nozzle diameter.
+
+## Commands
+
+Manual run (verbose logging to `logs/` and stdout):
 
 ```bash
 python3 -c "
@@ -52,66 +58,89 @@ sys.exit(run_postprocess([Path('model.gcode')], quiet=False))
 "
 ```
 
-Ponto de entrada do PrusaSlicer (silencioso, após cada export):
+PrusaSlicer entry point (quiet; PrusaSlicer passes the path):
 
 ```bash
 python3 scripts/gcode_postprocess.py /path/to/model.gcode
 ```
 
-Logs e estado da última execução: `logs/` (gitignored).
+Reprocess ignoring the idempotency marker:
 
-## Arquitetura
+```bash
+python3 scripts/gcode_postprocess.py -f /path/to/model.gcode
+```
 
-Pipeline monolítico em `scripts/gcode_postprocess.py` (~1900 linhas):
+Logs and last-run state: `logs/e5s1_events.log`, `logs/e5s1_state.json` (gitignored).
+
+## Architecture
+
+Monolithic pipeline in `scripts/gcode_postprocess.py` (~2750 lines):
 
 ```
 PostProcessApp.run()
-  → parse_prusa_config (1× por arquivo)
+  → parse_prusa_config (once per file)
   → analyze → GcodeAnalysis
-  → strip_pp_lines (dedupe PA se reprocessamento)
+  → skip if marker present (unless force=True)
+  → strip_pp_lines (on reprocess: dedupe prior M900 PA lines)
   → transform_gcode
-       · transformadores por linha (fan, flow, caps, seams, bridges, camadas)
-       · repair_startup (G28, mesh, M109/M190, purge, Z-fix, saia)
-       · repair_small_perimeters (loops fechados, arcos G2/G3)
-       · repair_coast (anti-fiapo antes da retração de camada)
+       · per-line transformers (fan, flow, caps, seams, bridges, layers)
+       · repair_startup (G28, mesh, M109/M190, purge, Z-fix, skirt)
+       · repair_small_perimeters (closed loops; G2/G3 distance aware)
+       · repair_coast / repair_travel_coast / repair_travel_retract
+       · repair_travel_start_boost / repair_deretract
+       · repair_stale_layer_wipe / repair_stale_layer_gap
        · repair_layer_marker
+       · strip_pp_lines (remove in-body M900 PA before final inject)
        · inject_pa
   → validate → write in place
-  → analysis_after_transform (cache) + stats em logs/e5s1_state.json
+  → analysis_after_transform + stats → logs/e5s1_state.json
 ```
 
-**Transformadores** (ordem fixa): tracking de F, macro de startup, cabeçalho/marcador, `;TYPE:` features, fan de ironing, fronteira de camada, cap de aceleração, cap de fan, cap de velocidade/volumétrico, cap de travel.
+**Per-line transformers** (fixed order): F tracking, startup macro fix, header/marker, `;TYPE:` features, ironing fan, layer boundary, `M204` accel cap (`P` and legacy `S`), fan cap, extrusion speed/volumetric cap, travel cap.
 
-**Reparos pós-transform:**
-- **Startup** — homing, mesh, M109, **M190** (se só M140), purge, Z-fix (ignora `G91`), `G90` antes de purge/saia
-- **Overhangs sem suporte** — **max part cooling** (fan máximo por camada + PWM max em overhang/perímetro); action `max_part_cooling`
-- **Perímetros / loops pequenos** — arcos G2/G3; loop &lt; 25 mm ou raio &lt; 12 mm: boost 108% nos primeiros ~2 mm, slow fechamento nos últimos 3 mm, fan off em loops &lt; 15 mm (camadas 1–3)
-- **Coast + wipe + deretract** — coast antes de retração de camada e travel &gt; 5 mm; wipe 2 mm após retração; deretract lento F700
-- **Marcadores de camada** — normaliza `;BEFORE_LAYER_CHANGE` / sync quando ausentes
+**Post-transform repairs**
 
-**Idempotência:** arquivos com `; --- E5S1 postprocess ---` são ignorados, salvo `force=True` em `run_postprocess()`.
+| Repair | Behavior |
+|--------|----------|
+| **Startup** | `G28` if missing; `M420 S1` + `M420 Z10` after homing if no mesh/`G29`; `M190` if only `M140`; `M109` if missing; purge block if no startup extrusion; Z-fix on postprocess lines; `G90` before purge/skirt when head is in `G91` |
+| **Overhangs without support** | `max_part_cooling`: full fan PWM on overhang/perimeter features |
+| **Small perimeters / loops** | Closed loops &lt; 20 mm, or &lt; 25 mm / radius &lt; 12 mm: flow boost, close slowdown (seam join speed), fan off on loops &lt; 15 mm (layers 1–3) |
+| **Coast + wipe + deretract** | Coast before layer retract and before travel &gt; 5 mm; 2 mm wipe after layer retract; slow deretract (`F700`) on small positive E-only moves |
+| **Travel** | Extra retract on long travel; 108% flow boost for ~2.5 mm after long travel |
+| **Layer markers** | Normalizes `;BEFORE_LAYER_CHANGE` / `G92 E0` sync when absent |
 
-**Análise vs tuning:** `parse_prusa_config` alimenta contagem de camadas e metadados; `build_e5s1_profile()` define PWM, retract, PA e limites de velocidade.
+**Idempotency:** files containing `; --- E5S1 postprocess ---` are skipped unless `force=True` / `-f`.
 
-## Perfil de hardware (padrões)
+**Analysis vs tuning:** `parse_prusa_config` feeds layer count and metadata; `build_e5s1_profile()` defines PWM, retract, PA, and speed limits.
 
-Calibrado para **Ender-5 S1 + bico 0.8 mm** (constantes em `gcode_postprocess.py`):
+**Pressure advance:** `apply_pa()` emits per-feature `M900` during transform (scaled K for infill, perimeter, bridge, ironing). Before write, `strip_pp_lines()` removes those in-body `M900` lines; `inject_pa()` inserts a single `M900 K{PA_K}` in the startup head (after last extrusion or `M109`) if none is present. Exported G-code therefore carries one global PA value unless the slicer already placed `M900` in the head.
 
-| Parâmetro | Valor |
+## Default hardware profile
+
+Calibrated for **Ender-5 S1 + 0.8 mm nozzle** (constants in `gcode_postprocess.py`):
+
+| Parameter | Value |
 |-----------|-------|
-| Impressora | Creality Ender-5 S1 |
-| Bico | 0.8 mm (high-flow / Spider) |
-| Altura 1ª camada | 0.24 mm |
-| Camadas sem fan | 2 |
-| Camada fan pleno | 5 |
+| Printer | Creality Ender-5 S1 |
+| Nozzle | 0.8 mm (high-flow / Spider) |
+| Build volume margins (skirt) | 2–218 mm (X/Y) |
+| First layer height (profile default) | 0.24 mm |
+| Fan off layers | 2 |
+| Full fan layer | 5 |
 | Pressure advance (`PA_K`) | 0.03 |
-| Fluxo volumétrico máx. | 24 mm³/s |
-| Paredes / infill (cap) | 38 / 75 mm/s |
-| Rampa fluxo camada 2 | 93% |
-| Saia | 3 loops, 40 mm lado |
-| Skirt offset pequena | 2,5 mm (bbox &lt; 45 mm) |
-| Fluxo / join de costura | 96% / 18 mm/s |
+| Max volumetric flow | 24 mm³/s |
+| Wall / infill speed cap | 38 / 75 mm/s |
+| Early-layer extrusion cap (layers 2–3) | 25 mm/s |
+| Travel speed cap | 40 mm/s |
+| First-layer print speed | 20 mm/s |
+| Flow ramp (layers 1–4) | 100%, 93%, 92%, 96% |
+| Layer accel (layers 1–3 / 4+) | 500 / 2000 mm/s² (`M204 P`) |
+| Retraction | 1.2 mm @ 45 mm/s, Z-hop 0.4 mm |
+| Skirt (if injected) | 3 loops, 40 mm side, origin (3, 3) mm |
+| Small-part skirt offset | 2.5 mm (bbox &lt; 45 mm) |
+| Seam flow / join speed | 96% / 18 mm/s |
+| Mesh on start (if injected) | `M420 S1` + `M420 Z10` fade |
 
-## Licença
+## License
 
-MIT — veja [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

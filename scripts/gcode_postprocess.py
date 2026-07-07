@@ -2750,4 +2750,6 @@ def run_postprocess(paths: list[Path], quiet: bool = False, force: bool = False,
 
 if __name__ == "__main__":
     argv = sys.argv[1:]
-    sys.exit(PostProcessApp().run([Path(p) for p in argv], quiet=True, argv=argv))
+    force = "--force" in argv or "-f" in argv
+    paths = [Path(p) for p in argv if not p.startswith("-")]
+    sys.exit(PostProcessApp().run(paths, quiet=True, force=force, argv=argv))
