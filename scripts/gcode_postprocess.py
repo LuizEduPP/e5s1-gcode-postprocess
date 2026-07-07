@@ -130,7 +130,9 @@ FIRST_LAYER_SMALL_OPEN_MAX_MM = 30.0
 FIRST_LAYER_SMALL_OPEN_SPEED_MM_S = 14.0
 FIRST_LAYER_REPAIR_MAX_LAYER = 1
 LOOP_CLOSE_TOL_MM = 0.05
-SEAM_JOIN_FLOW_MM = 1.5
+SEAM_JOIN_FLOW_MM = 1.0
+SEAM_JOIN_FLOW_SMALL_MM = 2.5
+SEAM_FLOW_SMALL_LOOP_MAX_MM = 55.0
 
 SKIRT_OFFSET_SMALL_BBOX_MM = 45.0
 
@@ -195,9 +197,11 @@ LAYER_CAP_EXTRUSION = 1
 LAYER_FIRST_MOTION = 3
 
 SEAM_EXTRA_RETRACT_MM = 0.4
-SEAM_FLOW_PCT = 96
+SEAM_FLOW_PCT = 100
+SEAM_FLOW_SMALL_PCT = 105
+SEAM_JOIN_E_BOOST_RATIO = 1.04
 SEAM_FAN_PCT = 85
-SEAM_JOIN_SPEED_MM_S = 20.0
+SEAM_JOIN_SPEED_MM_S = 18.0
 
 SKIRT_LOOPS = 3
 SKIRT_SIDE_MM = 40.0
@@ -498,6 +502,16 @@ def _coast_e_on_line(line: str, coast_e: float, *, min_remain: float = COAST_MIN
     if e_val - coast_e < min_remain:
         return None
     new_e = e_val - coast_e
+    return E_VAL_RE.sub(f"E{new_e:.5f}", line, count=1)
+
+def _join_boost_e_on_line(line: str, ratio: float) -> str | None:
+    m = E_VAL_RE.search(line)
+    if not m:
+        return None
+    e_val = float(m.group(1))
+    if e_val <= 0:
+        return None
+    new_e = e_val * ratio
     return E_VAL_RE.sub(f"E{new_e:.5f}", line, count=1)
 
 def _coast_blocked_before_travel(lines: list[str], ext_i: int, travel_i: int) -> bool:
@@ -1624,21 +1638,32 @@ def repair_perimeter_seam_join(
     join_f = profile["seam_join_f"]
     seam_flow = profile["seam_flow_pct"]
     joined = 0
+    flow_joined = 0
 
     for seg, dist, _layer, closed, kind in _collect_perimeter_segments(region):
         if not closed or not seg:
             continue
         i1 = seg[-1]
-        overrides[i1] = cap_f_line(region[i1], join_f, join_f, builder)[0] + " ; postprocess loop close cap"
+        join_line = cap_f_line(region[i1], join_f, join_f, builder)[0]
+        small_loop = dist < SEAM_FLOW_SMALL_LOOP_MAX_MM
+        if small_loop and kind in FEAT_PERIMETER:
+            boosted = _join_boost_e_on_line(join_line, SEAM_JOIN_E_BOOST_RATIO)
+            if boosted:
+                join_line = boosted + " ; postprocess loop close e boost"
+        overrides[i1] = join_line + " ; postprocess loop close cap"
         joined += 1
-        if kind == "external" and seam_flow < FLOW_NORMAL_PCT:
-            cum = _segment_cumulative_dist(region, seg)
-            join_start = next((idx for idx, d in cum if dist - d <= SEAM_JOIN_FLOW_MM), None)
-            if join_start is not None:
-                inject_before.setdefault(join_start, []).append(
-                    builder.flow_seam(seam_flow),
-                )
-                inject_after.setdefault(i1, []).append(builder.flow_reset())
+        if kind in FEAT_PERIMETER:
+            join_mm = SEAM_JOIN_FLOW_SMALL_MM if small_loop else SEAM_JOIN_FLOW_MM
+            flow_pct = SEAM_FLOW_SMALL_PCT if small_loop else seam_flow
+            if flow_pct != FLOW_NORMAL_PCT:
+                cum = _segment_cumulative_dist(region, seg)
+                join_start = next((idx for idx, d in cum if dist - d <= join_mm), None)
+                if join_start is not None:
+                    inject_before.setdefault(join_start, []).append(
+                        builder.flow_seam(flow_pct),
+                    )
+                    inject_after.setdefault(i1, []).append(builder.flow_reset())
+                    flow_joined += 1
 
     if not joined:
         return lines
@@ -1653,6 +1678,8 @@ def repair_perimeter_seam_join(
         for ln in reversed(inject_before[idx]):
             out.insert(idx, ln)
     actions.append(f"perimeter_seam_join×{joined}")
+    if flow_joined:
+        actions.append(f"flow_seam_join×{flow_joined}")
     return lines[:start] + out
 
 def repair_small_perimeter_speed(
