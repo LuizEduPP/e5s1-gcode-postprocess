@@ -105,7 +105,8 @@ PostProcessApp.run()
 |--------|----------|
 | **Startup** | `G28` if missing; `M420 S1` + `M420 Z10` after homing if no mesh/`G29`; `M190` if only `M140`; `M109` if missing; purge block if no startup extrusion; Z-fix on postprocess lines; `G90` before purge/skirt when head is in `G91` |
 | **Overhangs without support** | `max_part_cooling`: full fan PWM on overhang/perimeter features |
-| **Small perimeters** | Open perimeter segments &lt; 20 mm: speed cap on first extrusion only |
+| **Small perimeters** | Open perimeter segments &lt; 20 mm (layer 2+): speed cap on first extrusion only |
+| **First layer small features** | Layer 1 only: closed loops &lt; 80 mm at 18 mm/s; open segments &lt; 25 mm at 16 mm/s |
 | **Perimeter seam join** | All closed loops: join speed cap on last point; external walls: 96% flow on last 1.5 mm before close (not at loop start) |
 | **Coast + wipe + deretract** | Coast before layer retract; 2 mm wipe after layer retract; slow deretract (`F700`) on small positive E-only moves |
 | **Travel (infill only)** | Coast/retract/boost only on long infill→infill travels (&gt; 5 mm), never on walls |
@@ -142,6 +143,7 @@ Calibrated for **Ender-5 S1 + 0.8 mm nozzle** (constants in `gcode_postprocess.p
 | Skirt (if injected) | 3 loops, 40 mm side, origin (3, 3) mm |
 | Small-part skirt offset | 2.5 mm (bbox &lt; 45 mm) |
 | Seam flow / join speed | 96% at join (last 1.5 mm) / 24 mm/s close cap |
+| First layer small loops / open | 18 / 16 mm/s (&lt; 80 / 25 mm) |
 | Mesh on start (if injected) | `M420 S1` + `M420 Z10` fade |
 
 ## License

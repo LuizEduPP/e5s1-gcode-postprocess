@@ -118,6 +118,11 @@ LARGE_EXTRUDE_LINE_ESTIMATE_MULT = 50
 
 SMALL_PERIMETER_THRESHOLD_MM = 20.0
 SMALL_PERIMETER_SPEED_CAP_F = 1500
+FIRST_LAYER_LOOP_MAX_MM = 80.0
+FIRST_LAYER_LOOP_SPEED_MM_S = 18.0
+FIRST_LAYER_SMALL_OPEN_MAX_MM = 25.0
+FIRST_LAYER_SMALL_OPEN_SPEED_MM_S = 16.0
+FIRST_LAYER_REPAIR_MAX_LAYER = 1
 LOOP_CLOSE_TOL_MM = 0.05
 SEAM_JOIN_FLOW_MM = 1.5
 
@@ -1625,6 +1630,45 @@ def repair_perimeter_seam_join(
     actions.append(f"perimeter_seam_join×{joined}")
     return lines[:start] + out
 
+def repair_first_layer_small_perimeters(
+    lines: list[str],
+    builder: GCodeBuilder,
+    actions: list[str],
+    *,
+    body_start: int | None = None,
+) -> list[str]:
+    start = body_start if body_start is not None else head_index(lines)
+    region = lines[start:]
+    overrides: dict[int, str] = {}
+    loop_f = mm_s_to_f(FIRST_LAYER_LOOP_SPEED_MM_S)
+    open_f = mm_s_to_f(FIRST_LAYER_SMALL_OPEN_SPEED_MM_S)
+    slowed = 0
+
+    for seg, dist, layer, closed, _kind in _collect_perimeter_segments(region):
+        if layer > FIRST_LAYER_REPAIR_MAX_LAYER or not seg:
+            continue
+        if closed and dist < FIRST_LAYER_LOOP_MAX_MM:
+            cap_f = loop_f
+            comment = "postprocess first layer loop speed"
+        elif not closed and dist < FIRST_LAYER_SMALL_OPEN_MAX_MM:
+            cap_f = open_f
+            comment = "postprocess first layer small perimeter speed"
+        else:
+            continue
+        for idx in seg:
+            line, _, _ = cap_f_line(region[idx], cap_f, cap_f, builder)
+            overrides[idx] = line + f" ; {comment}"
+        slowed += 1
+
+    if not slowed:
+        return lines
+
+    out = list(region)
+    for idx in sorted(overrides, reverse=True):
+        out[idx] = overrides[idx]
+    actions.append(f"first_layer_small_perimeters×{slowed}")
+    return lines[:start] + out
+
 def repair_small_perimeters(
     lines: list[str],
     builder: GCodeBuilder,
@@ -1637,8 +1681,8 @@ def repair_small_perimeters(
     overrides: dict[int, str] = {}
     capped = 0
 
-    for seg, dist, _layer, closed, _kind in _collect_perimeter_segments(region):
-        if closed or dist >= SMALL_PERIMETER_THRESHOLD_MM or not seg:
+    for seg, dist, layer, closed, _kind in _collect_perimeter_segments(region):
+        if layer <= FIRST_LAYER_REPAIR_MAX_LAYER or closed or dist >= SMALL_PERIMETER_THRESHOLD_MM or not seg:
             continue
         i0 = seg[0]
         line, _, _ = cap_f_line(region[i0], SMALL_PERIMETER_SPEED_CAP_F, SMALL_PERIMETER_SPEED_CAP_F, builder)
@@ -2550,6 +2594,7 @@ def transform_gcode(
     out = ctx.out
     out, body_start = repair_startup(out, profile, builder, repair_actions)
     out = repair_perimeter_seam_join(out, profile, builder, repair_actions, body_start=body_start)
+    out = repair_first_layer_small_perimeters(out, builder, repair_actions, body_start=body_start)
     out = repair_small_perimeters(out, builder, repair_actions, body_start=body_start)
     out = repair_coast(out, repair_actions)
     out = repair_travel_coast(out, repair_actions)
