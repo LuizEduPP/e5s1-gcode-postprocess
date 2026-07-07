@@ -86,7 +86,7 @@ PostProcessApp.run()
        · per-line transformers (fan, flow, caps, seams, bridges, layers)
        · repair_startup (G28, mesh, M109/M190, purge, Z-fix, skirt)
        · repair_perimeter_seam_join (closed loops: join speed + seam flow at close)
-       · repair_small_perimeters (open short segments only; speed cap at start)
+       · repair_small_perimeter_speed (tiered caps: loops + open segments, all layers)
        · repair_coast / repair_travel_coast / repair_travel_retract
        · repair_travel_start_boost / repair_deretract
        · repair_stale_layer_wipe / repair_stale_layer_gap
@@ -105,9 +105,8 @@ PostProcessApp.run()
 |--------|----------|
 | **Startup** | `G28` if missing; `M420 S1` + `M420 Z10` after homing if no mesh/`G29`; `M190` if only `M140`; `M109` if missing; purge block if no startup extrusion; Z-fix on postprocess lines; `G90` before purge/skirt when head is in `G91` |
 | **Overhangs without support** | `max_part_cooling`: full fan PWM on overhang/perimeter features |
-| **Small perimeters** | Open perimeter segments &lt; 20 mm (layer 2+): speed cap on first extrusion only |
-| **First layer small features** | Layer 1 only: closed loops &lt; 80 mm at 18 mm/s; open segments &lt; 25 mm at 16 mm/s |
-| **Perimeter seam join** | All closed loops: join speed cap on last point; external walls: 96% flow on last 1.5 mm before close (not at loop start) |
+| **Small perimeters** | Tiered speed on full segment — loops (circles/squares/tubes) and open walls; all layers |
+| **Perimeter seam join** | All closed loops: 96% flow on last 1.5 mm before close (external only) |
 | **Coast + wipe + deretract** | Coast before layer retract; 2 mm wipe after layer retract; slow deretract (`F700`) on small positive E-only moves |
 | **Travel (infill only)** | Coast/retract/boost only on long infill→infill travels (&gt; 5 mm), never on walls |
 | **Layer markers** | Normalizes `;BEFORE_LAYER_CHANGE` / `G92 E0` sync when absent |
@@ -131,19 +130,20 @@ Calibrated for **Ender-5 S1 + 0.8 mm nozzle** (constants in `gcode_postprocess.p
 | Fan off layers | 1 |
 | Full fan layer | 4 |
 | Pressure advance (`PA_K`) | 0.034 |
-| Max volumetric flow | 28 mm³/s |
-| External / internal wall cap | 46 / 54 mm/s |
-| Infill speed cap | 92 mm/s |
-| Early-layer extrusion cap (layer 2) | 34 mm/s |
-| Travel speed cap | 130 mm/s |
-| First-layer print speed | 24 mm/s |
+| Max volumetric flow | 30 mm³/s |
+| External / internal wall cap | 52 / 62 mm/s |
+| Infill speed cap | 105 mm/s |
+| Early-layer extrusion cap (layer 2 only) | 40 mm/s |
+| Travel speed cap | 150 mm/s |
+| First-layer print speed | 26 mm/s |
 | Flow ramp (layers 1–4) | 100%, 97%, 98%, 100% |
-| Layer accel (layers 1–3 / 4+) | 800 / 3500 mm/s² (`M204 P`) |
+| Layer accel (layers 1–3 / 4+) | 800 / 4000 mm/s² (`M204 P`) |
 | Retraction | 1.2 mm @ 50 mm/s, Z-hop 0.4 mm |
 | Skirt (if injected) | 3 loops, 40 mm side, origin (3, 3) mm |
 | Small-part skirt offset | 2.5 mm (bbox &lt; 45 mm) |
-| Seam flow / join speed | 96% at join (last 1.5 mm) / 24 mm/s close cap |
-| First layer small loops / open | 18 / 16 mm/s (&lt; 80 / 25 mm) |
+| Seam flow / join speed | 96% at join (last 1.5 mm) / 20 mm/s close cap |
+| Small loops L2+ (perimeter) | tiny &lt;30 mm → 20 / small &lt;55 → 26 mm/s; ≥55 mm → perfil rápido |
+| Small loops L1 (perimeter) | tiny &lt;35 mm → 14 / loop &lt;100 mm → 16 / open &lt;30 → 14 mm/s |
 | Mesh on start (if injected) | `M420 S1` + `M420 Z10` fade |
 
 ## License
