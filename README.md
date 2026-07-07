@@ -85,7 +85,8 @@ PostProcessApp.run()
   → transform_gcode
        · per-line transformers (fan, flow, caps, seams, bridges, layers)
        · repair_startup (G28, mesh, M109/M190, purge, Z-fix, skirt)
-       · repair_small_perimeters (closed loops; G2/G3 distance aware)
+       · repair_perimeter_seam_join (closed loops: join speed + seam flow at close)
+       · repair_small_perimeters (open short segments only; speed cap at start)
        · repair_coast / repair_travel_coast / repair_travel_retract
        · repair_travel_start_boost / repair_deretract
        · repair_stale_layer_wipe / repair_stale_layer_gap
@@ -104,9 +105,10 @@ PostProcessApp.run()
 |--------|----------|
 | **Startup** | `G28` if missing; `M420 S1` + `M420 Z10` after homing if no mesh/`G29`; `M190` if only `M140`; `M109` if missing; purge block if no startup extrusion; Z-fix on postprocess lines; `G90` before purge/skirt when head is in `G91` |
 | **Overhangs without support** | `max_part_cooling`: full fan PWM on overhang/perimeter features |
-| **Small perimeters / loops** | Closed loops &lt; 20 mm, or &lt; 25 mm / radius &lt; 12 mm: flow boost, close slowdown (seam join speed), fan off on loops &lt; 15 mm (layers 1–3) |
-| **Coast + wipe + deretract** | Coast before layer retract and before travel &gt; 5 mm; 2 mm wipe after layer retract; slow deretract (`F700`) on small positive E-only moves |
-| **Travel** | Extra retract on long travel; 108% flow boost for ~2.5 mm after long travel |
+| **Small perimeters** | Open perimeter segments &lt; 20 mm: speed cap on first extrusion only |
+| **Perimeter seam join** | All closed loops: join speed cap on last point; external walls: 96% flow on last 1.5 mm before close (not at loop start) |
+| **Coast + wipe + deretract** | Coast before layer retract; 2 mm wipe after layer retract; slow deretract (`F700`) on small positive E-only moves |
+| **Travel (infill only)** | Coast/retract/boost only on long infill→infill travels (&gt; 5 mm), never on walls |
 | **Layer markers** | Normalizes `;BEFORE_LAYER_CHANGE` / `G92 E0` sync when absent |
 
 **Idempotency:** files containing `; --- E5S1 postprocess ---` are skipped unless `force=True` / `-f`.
@@ -138,7 +140,7 @@ Calibrated for **Ender-5 S1 + 0.8 mm nozzle** (constants in `gcode_postprocess.p
 | Retraction | 1.2 mm @ 45 mm/s, Z-hop 0.4 mm |
 | Skirt (if injected) | 3 loops, 40 mm side, origin (3, 3) mm |
 | Small-part skirt offset | 2.5 mm (bbox &lt; 45 mm) |
-| Seam flow / join speed | 96% / 18 mm/s |
+| Seam flow / join speed | 96% at join (last 1.5 mm) / 18 mm/s close cap |
 | Mesh on start (if injected) | `M420 S1` + `M420 Z10` fade |
 
 ## License

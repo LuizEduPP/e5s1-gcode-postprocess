@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
+"""E5S1 G-code post-processor — constants, profile, transform pipeline, and CLI."""
 from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 import heapq
 import json
 import math
@@ -11,8 +12,6 @@ import os
 import re
 import sys
 import time
-
-"""E5S1 G-code post-processor — constants, profile, transform pipeline, and CLI."""
 
 PROJECT = Path(__file__).resolve().parent.parent
 LOG_DIR = PROJECT / "logs"
@@ -119,15 +118,8 @@ LARGE_EXTRUDE_LINE_ESTIMATE_MULT = 50
 
 SMALL_PERIMETER_THRESHOLD_MM = 20.0
 SMALL_PERIMETER_SPEED_CAP_F = 900
-SMALL_PERIMETER_FLOW_BOOST_PCT = 105
-SMALL_LOOP_RADIUS_MM = 12.0
-SMALL_LOOP_PERIMETER_MAX_MM = 25.0
-SMALL_LOOP_CLOSE_MM = 3.0
-SMALL_LOOP_START_BOOST_MM = 2.0
-SMALL_LOOP_START_BOOST_PCT = 108
-SMALL_LOOP_FAN_OFF_LAYERS = 3
-SMALL_LOOP_FAN_OFF_MAX_MM = 15.0
 LOOP_CLOSE_TOL_MM = 0.05
+SEAM_JOIN_FLOW_MM = 1.5
 
 SKIRT_OFFSET_SMALL_BBOX_MM = 45.0
 
@@ -354,7 +346,6 @@ class GcodeStats(TypedDict):
     layer_h: float | None
     est_seconds: int | None
 
-# kind (type_feature) -> chave pwm no perfil
 FAN_PROFILE_KEYS: dict[str, str] = {
     "top": "top_fan_pwm",
     "ironing": "ironing_fan_pwm",
@@ -884,7 +875,7 @@ class GCodeAnalyzer:
     def is_postprocessed(self, text: str) -> bool:
         return MARKER in text
 
-    def count_pp_fan_lines(self, text: str, large: bool) -> int:
+    def count_pp_fan_lines(self, text: str) -> int:
         return len(PP_FAN_RE.findall(text))
 
     def has_pressure_advance(self, text: str) -> bool:
@@ -941,7 +932,7 @@ class GCodeAnalyzer:
         a = analysis or self.analyze(text)
         return {
             **{k: a[k] for k in _ANALYSIS_STAT_KEYS},
-            "fan_pp": fan_pp if fan_pp is not None else self.count_pp_fan_lines(text, a["large"]),
+            "fan_pp": fan_pp if fan_pp is not None else self.count_pp_fan_lines(text),
             "postprocessed": self.is_postprocessed(text),
             "pressure_advance": self.has_pressure_advance(text[:HEAD_SCAN_BYTES]),
         }
@@ -969,7 +960,7 @@ class GCodeValidator:
 
         if expect_postprocess and not pp:
             warnings.append("Missing E5S1 marker — post-process not applied")
-        elif expect_postprocess and self.analyzer.count_pp_fan_lines(text, large) == 0:
+        elif expect_postprocess and self.analyzer.count_pp_fan_lines(text) == 0:
             warnings.append("Marker present but no post-process M106 fan commands")
 
         if not pp:
@@ -1125,6 +1116,8 @@ def e5s1_fan_target_label(
         pwm = min(profile["seam_fan_pwm"], profile["min_fan_pwm"]) if kind == "perimeter" else profile["seam_fan_pwm"]
         return pwm, "seam"
     if kind in (FEAT_SEAM | {"bottom", "brim"}) and layer_count <= profile["fan_off_layers"]:
+        if kind in FEAT_SEAM:
+            return profile["min_fan_pwm"], "adhesion"
         return (layer_fan_cap if layer_fan_cap is not None else 0), "adhesion"
     return None
 
@@ -1333,14 +1326,6 @@ def _skirt_offset_mm(bbox: tuple[float, float, float, float] | None) -> float:
         return SKIRT_OFFSET_SMALL_MM
     return SKIRT_OFFSET_MM
 
-def _loop_radius_mm(perimeter_mm: float) -> float:
-    return perimeter_mm / (2 * math.pi)
-
-def _is_small_loop(perimeter_mm: float, closed: bool) -> bool:
-    if not closed or perimeter_mm <= 0:
-        return False
-    return perimeter_mm < SMALL_LOOP_PERIMETER_MAX_MM or _loop_radius_mm(perimeter_mm) < SMALL_LOOP_RADIUS_MM
-
 def _segment_cumulative_dist(region: list[str], seg: list[int]) -> list[tuple[int, float]]:
     out: list[tuple[int, float]] = []
     cum = 0.0
@@ -1508,20 +1493,14 @@ def _segment_closed(region: list[str], seg: list[int]) -> bool:
         return False
     return math.hypot(lx - sx, ly - sy) <= LOOP_CLOSE_TOL_MM
 
-def repair_small_perimeters(
-    lines: list[str],
-    profile: E5S1Profile,
-    builder: GCodeBuilder,
-    actions: list[str],
-    *,
-    body_start: int | None = None,
-) -> list[str]:
-    start = body_start if body_start is not None else head_index(lines)
-    region = lines[start:]
-    segments: list[tuple[list[int], float, int, bool]] = []
+def _collect_perimeter_segments(
+    region: list[str],
+) -> list[tuple[list[int], float, int, bool, str]]:
+    segments: list[tuple[list[int], float, int, bool, str]] = []
     in_perimeter = False
     curr_seg: list[int] = []
     curr_dist = 0.0
+    curr_kind = "perimeter"
     last_x, last_y = None, None
     layer_num = 0
 
@@ -1531,14 +1510,15 @@ def repair_small_perimeters(
         feat = type_feature(line)
         if feat in FEAT_PERIMETER:
             if curr_seg:
-                segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg)))
+                segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg), curr_kind))
             in_perimeter = True
+            curr_kind = feat
             curr_seg = []
             curr_dist = 0.0
         elif feat is not None:
             in_perimeter = False
             if curr_seg:
-                segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg)))
+                segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg), curr_kind))
                 curr_seg = []
 
         upper = line.upper()
@@ -1555,61 +1535,78 @@ def repair_small_perimeters(
                     curr_dist += step
                 curr_seg.append(i)
             elif curr_seg:
-                segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg)))
+                segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg), curr_kind))
                 curr_seg = []
 
             last_x, last_y = x, y
 
     if curr_seg:
-        segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg)))
+        segments.append((curr_seg, curr_dist, layer_num, _segment_closed(region, curr_seg), curr_kind))
+    return segments
 
-    small_segments = [s for s in segments if 0 < s[1] < SMALL_PERIMETER_THRESHOLD_MM]
-    if not small_segments:
-        return lines
+def _feature_before(lines: list[str], idx: int, lookback: int = 24) -> str | None:
+    for j in range(idx - 1, max(idx - lookback, -1), -1):
+        feat = type_feature(lines[j])
+        if feat is not None:
+            return feat
+    return None
 
+def _feature_after(lines: list[str], idx: int, lookahead: int = 24) -> str | None:
+    for j in range(idx + 1, min(idx + lookahead, len(lines))):
+        feat = type_feature(lines[j])
+        if feat is not None:
+            return feat
+    return None
+
+def _infill_long_travel(lines: list[str], ext_i: int, travel_i: int, travel_mm: float) -> bool:
+    if travel_mm < TRAVEL_COAST_MIN_MM:
+        return False
+    if _near_layer_end(lines, ext_i, travel_i):
+        return False
+    if _coast_blocked_before_travel(lines, ext_i, travel_i):
+        return False
+    if _active_wall_feature(lines, ext_i) or _wall_travel_target(lines, travel_i):
+        return False
+    src = _feature_before(lines, ext_i)
+    dst = _feature_after(lines, travel_i)
+    if src in FEAT_WALL or dst in FEAT_WALL:
+        return False
+    return src in FEAT_INFILL and dst in FEAT_INFILL
+
+def repair_perimeter_seam_join(
+    lines: list[str],
+    profile: E5S1Profile,
+    builder: GCodeBuilder,
+    actions: list[str],
+    *,
+    body_start: int | None = None,
+) -> list[str]:
+    start = body_start if body_start is not None else head_index(lines)
+    region = lines[start:]
     inject_before: dict[int, list[str]] = {}
     inject_after: dict[int, list[str]] = {}
     overrides: dict[int, str] = {}
     join_f = profile["seam_join_f"]
+    seam_flow = profile["seam_flow_pct"]
+    joined = 0
 
-    for seg, dist, layer_at, closed in small_segments:
-        i0, i1 = seg[0], seg[-1]
-        small_loop = _is_small_loop(dist, closed)
-        cum = _segment_cumulative_dist(region, seg)
-
-        if small_loop:
-            start_pct = SMALL_LOOP_START_BOOST_PCT
-            inject_before.setdefault(i0, []).append(builder.flow_boost(start_pct, "small loop start"))
-            boost_end = i0
-            for idx, d in cum:
-                if d <= SMALL_LOOP_START_BOOST_MM:
-                    boost_end = idx
-                else:
-                    break
-            if boost_end != i1:
-                inject_after.setdefault(boost_end, []).append(builder.flow_reset())
-            else:
+    for seg, dist, _layer, closed, kind in _collect_perimeter_segments(region):
+        if not closed or not seg:
+            continue
+        i1 = seg[-1]
+        overrides[i1] = cap_f_line(region[i1], join_f, join_f, builder)[0] + " ; postprocess loop close cap"
+        joined += 1
+        if kind == "external" and seam_flow < FLOW_NORMAL_PCT:
+            cum = _segment_cumulative_dist(region, seg)
+            join_start = next((idx for idx, d in cum if dist - d <= SEAM_JOIN_FLOW_MM), None)
+            if join_start is not None:
+                inject_before.setdefault(join_start, []).append(
+                    builder.flow_seam(seam_flow),
+                )
                 inject_after.setdefault(i1, []).append(builder.flow_reset())
-            for idx, d in cum:
-                if dist - d <= SMALL_LOOP_CLOSE_MM:
-                    overrides[idx] = cap_f_line(region[idx], join_f, join_f, builder)[0] + " ; postprocess loop close cap"
-            if dist < SMALL_LOOP_FAN_OFF_MAX_MM and layer_at <= SMALL_LOOP_FAN_OFF_LAYERS:
-                inject_before.setdefault(i0, []).insert(0, "M106 S0 ; postprocess small loop fan hold")
-                layer_pwm = fan_pwm_for_layer(layer_at, profile)
-                if layer_pwm is not None:
-                    inject_after.setdefault(i1, []).append(builder.fan_restore(layer_pwm))
-        else:
-            inject_before.setdefault(i0, []).append(builder.flow_boost(SMALL_PERIMETER_FLOW_BOOST_PCT, "small perimeter flow boost"))
-            inject_after.setdefault(i0, []).append(builder.flow_reset())
-            capped, _, _ = cap_f_line(region[i0], SMALL_PERIMETER_SPEED_CAP_F, SMALL_PERIMETER_SPEED_CAP_F, builder)
-            overrides[i0] = capped + " ; postprocess small perimeter speed cap"
-            if dist < SMALL_LOOP_CLOSE_MM:
-                overrides[i1] = cap_f_line(region[i1], join_f, join_f, builder)[0] + " ; postprocess loop close cap"
-            if dist < SMALL_LOOP_FAN_OFF_MAX_MM and layer_at <= SMALL_LOOP_FAN_OFF_LAYERS:
-                inject_before.setdefault(i0, []).insert(0, "M106 S0 ; postprocess small loop fan hold")
-                layer_pwm = fan_pwm_for_layer(layer_at, profile)
-                if layer_pwm is not None:
-                    inject_after.setdefault(i1, []).append(builder.fan_restore(layer_pwm))
+
+    if not joined:
+        return lines
 
     out = list(region)
     for idx in sorted(overrides, reverse=True):
@@ -1620,8 +1617,36 @@ def repair_small_perimeters(
     for idx in sorted(inject_before, reverse=True):
         for ln in reversed(inject_before[idx]):
             out.insert(idx, ln)
+    actions.append(f"perimeter_seam_join×{joined}")
+    return lines[:start] + out
 
-    actions.append(f"small_perimeters_fixed×{len(small_segments)}")
+def repair_small_perimeters(
+    lines: list[str],
+    builder: GCodeBuilder,
+    actions: list[str],
+    *,
+    body_start: int | None = None,
+) -> list[str]:
+    start = body_start if body_start is not None else head_index(lines)
+    region = lines[start:]
+    overrides: dict[int, str] = {}
+    capped = 0
+
+    for seg, dist, _layer, closed, _kind in _collect_perimeter_segments(region):
+        if closed or dist >= SMALL_PERIMETER_THRESHOLD_MM or not seg:
+            continue
+        i0 = seg[0]
+        line, _, _ = cap_f_line(region[i0], SMALL_PERIMETER_SPEED_CAP_F, SMALL_PERIMETER_SPEED_CAP_F, builder)
+        overrides[i0] = line + " ; postprocess small perimeter speed cap"
+        capped += 1
+
+    if not capped:
+        return lines
+
+    out = list(region)
+    for idx in sorted(overrides, reverse=True):
+        out[idx] = overrides[idx]
+    actions.append(f"small_perimeters_fixed×{capped}")
     return lines[:start] + out
 
 def repair_coast(lines: list[str], actions: list[str]) -> list[str]:
@@ -1669,18 +1694,15 @@ def repair_travel_coast(lines: list[str], actions: list[str]) -> list[str]:
         step, x, y = _motion_step_mm(line, last_x, last_y)
         if is_extrude:
             last_ext_i = i
-        elif step >= TRAVEL_COAST_MIN_MM and last_ext_i is not None and "postprocess coast" not in out[last_ext_i]:
-            if _near_layer_end(out, last_ext_i, i):
-                last_ext_i = None
-                continue
-            if _coast_blocked_before_travel(out, last_ext_i, i):
-                last_ext_i = None
-                continue
-            new_line = _coast_e_on_line(out[last_ext_i], COAST_E_MM)
-            if new_line:
-                out[last_ext_i] = new_line + " ; postprocess coast travel"
-                coasted += 1
-                last_ext_i = None
+        elif last_ext_i is not None:
+            ext_i = cast(int, last_ext_i)
+            if "postprocess coast" not in out[ext_i]:
+                if _infill_long_travel(out, ext_i, i, step):
+                    new_line = _coast_e_on_line(out[ext_i], COAST_E_MM)
+                    if new_line:
+                        out[ext_i] = new_line + " ; postprocess coast travel"
+                        coasted += 1
+            last_ext_i = None
         if x is not None:
             last_x = x
         if y is not None:
@@ -1718,30 +1740,16 @@ def repair_travel_retract(
         step, x, y = _motion_step_mm(line, last_x, last_y)
         if is_extrude:
             last_ext_i = i
-        elif step >= TRAVEL_COAST_MIN_MM and last_ext_i is not None:
-            if _near_layer_end(out, last_ext_i, i):
-                last_ext_i = None
-                continue
-            if _coast_blocked_before_travel(out, last_ext_i, i):
-                last_ext_i = None
-                continue
-            if _has_retract_between(out, last_ext_i, i):
-                last_ext_i = None
-                continue
-            if _wall_travel_target(out, i):
-                last_ext_i = None
-                continue
-            if "postprocess coast" not in out[last_ext_i]:
-                new_line = _coast_e_on_line(out[last_ext_i], COAST_E_MM)
-                if new_line:
-                    out[last_ext_i] = new_line + " ; postprocess coast travel"
-            out.insert(
-                i,
-                builder.travel_retract(TRAVEL_RETRACT_MM, profile["retract_f"]),
-            )
-            retracted += 1
+        elif last_ext_i is not None:
+            ext_i = cast(int, last_ext_i)
+            if _infill_long_travel(out, ext_i, i, step) and not _has_retract_between(out, ext_i, i):
+                out.insert(
+                    i,
+                    builder.travel_retract(TRAVEL_RETRACT_MM, profile["retract_f"]),
+                )
+                retracted += 1
+                i += 1
             last_ext_i = None
-            i += 1
         if x is not None:
             last_x = x
         if y is not None:
@@ -1772,7 +1780,6 @@ def _travel_mm_before_extrusion(lines: list[str], idx: int, lookback: int = 24) 
 
 def repair_travel_start_boost(
     lines: list[str],
-    profile: E5S1Profile,
     builder: GCodeBuilder,
     actions: list[str],
 ) -> list[str]:
@@ -1801,14 +1808,10 @@ def repair_travel_start_boost(
         if _travel_mm_before_extrusion(out, i) < TRAVEL_COAST_MIN_MM:
             i += 1
             continue
-        if any("travel start boost" in out[k].lower() for k in range(max(i - 4, 0), i)):
-            i += 1
-            continue
-        if any("small loop start" in out[k].lower() or "small perimeter flow boost" in out[k].lower()
-               for k in range(max(i - 3, 0), i)):
-            i += 1
-            continue
         if _near_layer_start(out, i) or _active_wall_feature(out, i):
+            i += 1
+            continue
+        if _feature_before(out, i) not in FEAT_INFILL:
             i += 1
             continue
         out.insert(i, builder.flow_boost(TRAVEL_START_BOOST_PCT, "travel start boost"))
@@ -1924,8 +1927,6 @@ def _after_layer_travel(lines: list[str], idx: int, lookback: int = 20) -> bool:
 def _slow_deretract_line(
     out: list[str],
     idx: int,
-    profile: E5S1Profile,
-    builder: GCodeBuilder,
     *,
     max_e: float,
 ) -> bool:
@@ -1942,7 +1943,7 @@ def _slow_deretract_line(
     out[idx] = f"{head} ; postprocess deretract slow"
     return True
 
-def repair_deretract(lines: list[str], profile: E5S1Profile, builder: GCodeBuilder, actions: list[str]) -> list[str]:
+def repair_deretract(lines: list[str], actions: list[str]) -> list[str]:
     out = list(lines)
     slowed = 0
     i = 0
@@ -1958,7 +1959,7 @@ def repair_deretract(lines: list[str], profile: E5S1Profile, builder: GCodeBuild
                     break
                 if float(m.group(1)) <= 0:
                     break
-                if _slow_deretract_line(out, j, profile, builder, max_e=DERETRACT_MAX_E_MM):
+                if _slow_deretract_line(out, j, max_e=DERETRACT_MAX_E_MM):
                     slowed += 1
                 break
         elif ((_after_slicer_wipe(out, i)
@@ -1966,7 +1967,7 @@ def repair_deretract(lines: list[str], profile: E5S1Profile, builder: GCodeBuild
                     and not _active_wall_feature(out, i)))
                 and not _after_layer_travel(out, i)
                 and not _near_layer_start(out, i)) and _slow_deretract_line(
-            out, i, profile, builder, max_e=SLICER_DERETRACT_MAX_E_MM,
+            out, i, max_e=SLICER_DERETRACT_MAX_E_MM,
         ):
             slowed += 1
         i += 1
@@ -2119,7 +2120,7 @@ def repair_layer_marker(
                 actions.append("layer_marker")
             patched.append(line)
         return patched
-    if count_layers(joined := "\n".join(lines), prusa_cfg) == 0:
+    if count_layers("\n".join(lines), prusa_cfg) == 0:
         patched = list(lines)
         for i, line in enumerate(patched):
             if LAYER_N_MARKER in line:
@@ -2156,14 +2157,14 @@ class TransformContext:
         skip_overhang_fan: bool,
         layer_h: float | None = None,
         *,
-        uses_before_after_markers: bool = True,
+        has_before_after_markers: bool = True,
         max_part_cooling: bool = False,
     ):
         self.profile = profile
         self.builder = builder
         self.skip_overhang_fan = skip_overhang_fan
         self.max_part_cooling = max_part_cooling
-        self.uses_before_after_markers = uses_before_after_markers
+        self.uses_before_after_markers = has_before_after_markers
         self.layer_h = layer_h or LAYER_HEIGHT_FIRST_MM
         self.out: list[str] = []
         self.actions: list[str] = []
@@ -2244,7 +2245,7 @@ class TransformContext:
             self.actions.append(f"accel_default_l{self.layer_count}")
         self.layer_fan_cap = cap
 
-def transform_speed_tracking(ctx: TransformContext, lines: list[str], idx: int) -> bool:
+def transform_speed_tracking(ctx: TransformContext, _lines: list[str], _idx: int) -> bool:
     if ctx.current_upper.startswith(("G0", "G1", "G2", "G3")):
         if fm := F_RE.search(ctx.current_line):
             ctx.last_f = int(fm.group(1))
@@ -2255,7 +2256,7 @@ def transform_speed_tracking(ctx: TransformContext, lines: list[str], idx: int) 
             ctx.last_y = _axis_float(m_y)
     return False
 
-def transform_startup_line(ctx: TransformContext, lines: list[str], idx: int) -> bool:
+def transform_startup_line(ctx: TransformContext, _lines: list[str], _idx: int) -> bool:
     if ctx.in_startup:
         fixed, fix_action = sanitize_startup_line(ctx.current_line, ctx.profile["first_layer_height_mm"])
         if fix_action:
@@ -2266,7 +2267,7 @@ def transform_startup_line(ctx: TransformContext, lines: list[str], idx: int) ->
             ctx.update_line(fixed)
     return False
 
-def transform_header(ctx: TransformContext, lines: list[str], idx: int) -> bool:
+def transform_header(ctx: TransformContext, _lines: list[str], _idx: int) -> bool:
     if ctx.current_line.startswith("; generated by"):
         ctx.out += [ctx.current_line, ctx.builder.timestamp(datetime.now().isoformat(timespec="seconds")), MARKER]
         ctx.actions.append("header")
@@ -2310,10 +2311,6 @@ def transform_feature_type(ctx: TransformContext, lines: list[str], idx: int) ->
 
         if feat in FEAT_FAN_TUNE:
             ctx.out.append(ctx.current_line)
-            if feat in FEAT_SEAM:
-                ctx.out.append(ctx.builder.flow_seam(ctx.profile["seam_flow_pct"]))
-                ctx.seam_flow = True
-                ctx.actions.append(f"flow_seam_S{ctx.profile['seam_flow_pct']}")
             skip_idx = tune_fan_speed(
                 ctx.out, ctx.actions, feat, lines, idx, ctx.layer_count, ctx.layer_fan_cap, ctx.profile, ctx.builder,
                 max_part_cooling=ctx.max_part_cooling,
@@ -2335,7 +2332,7 @@ def transform_feature_type(ctx: TransformContext, lines: list[str], idx: int) ->
 
     return False
 
-def transform_ironing_fan(ctx: TransformContext, lines: list[str], idx: int) -> bool:
+def transform_ironing_fan(ctx: TransformContext, _lines: list[str], _idx: int) -> bool:
     fan_m = FAN_ON_RE.match(ctx.current_line)
     if ctx.surface_kind == "ironing" and fan_m and "postprocess" not in ctx.current_line.lower():
         pwm = int(fan_m.group(1))
@@ -2402,7 +2399,7 @@ def transform_layer_boundary(ctx: TransformContext, lines: list[str], idx: int) 
         return True
     return False
 
-def transform_accel_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool:
+def transform_accel_cap(ctx: TransformContext, _lines: list[str], _idx: int) -> bool:
     if not (1 <= ctx.layer_count <= LAYER_FIRST_MOTION):
         return False
     cap_accel = ctx.profile["first_layer_accel"]
@@ -2431,7 +2428,7 @@ def transform_accel_cap(ctx: TransformContext, lines: list[str], idx: int) -> bo
         return True
     return False
 
-def transform_fan_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool:
+def transform_fan_cap(ctx: TransformContext, _lines: list[str], _idx: int) -> bool:
     fan_m = FAN_ON_RE.match(ctx.current_line)
     if ctx.in_startup and fan_m and int(fan_m.group(1)) > 0:
         ctx.out.append(ctx.builder.fan_startup_off())
@@ -2443,7 +2440,7 @@ def transform_fan_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool
         return True
     return False
 
-def transform_speed_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool:
+def transform_speed_cap(ctx: TransformContext, _lines: list[str], _idx: int) -> bool:
     fan_m = FAN_ON_RE.match(ctx.current_line)
     if (
         ctx.current_upper.startswith(("G0", "G1", "G2", "G3"))
@@ -2476,7 +2473,7 @@ def transform_speed_cap(ctx: TransformContext, lines: list[str], idx: int) -> bo
             return True
     return False
 
-def transform_travel_cap(ctx: TransformContext, lines: list[str], idx: int) -> bool:
+def transform_travel_cap(ctx: TransformContext, _lines: list[str], _idx: int) -> bool:
     fan_m = FAN_ON_RE.match(ctx.current_line)
     if (
         ctx.current_upper.startswith(("G0", "G1", "G2", "G3"))
@@ -2505,7 +2502,6 @@ def transform_gcode(
     skip_overhang_fan = analysis["large"] and analysis["overhang_markers"] > OVERHANG_FAN_SKIP_THRESHOLD and not need_sup
     cfg = prusa_cfg if prusa_cfg is not None else {}
 
-    body_idx = head_index(lines)
     uses_before_after = uses_before_after_markers(lines)
 
     builder = GCodeBuilder(pa_fw)
@@ -2514,7 +2510,7 @@ def transform_gcode(
         builder,
         skip_overhang_fan,
         analysis["layer_h"],
-        uses_before_after_markers=uses_before_after,
+        has_before_after_markers=uses_before_after,
         max_part_cooling=need_sup,
     )
 
@@ -2548,12 +2544,13 @@ def transform_gcode(
     repair_actions: list[str] = []
     out = ctx.out
     out, body_start = repair_startup(out, profile, builder, repair_actions)
-    out = repair_small_perimeters(out, profile, builder, repair_actions, body_start=body_start)
+    out = repair_perimeter_seam_join(out, profile, builder, repair_actions, body_start=body_start)
+    out = repair_small_perimeters(out, builder, repair_actions, body_start=body_start)
     out = repair_coast(out, repair_actions)
     out = repair_travel_coast(out, repair_actions)
     out = repair_travel_retract(out, profile, builder, repair_actions)
-    out = repair_travel_start_boost(out, profile, builder, repair_actions)
-    out = repair_deretract(out, profile, builder, repair_actions)
+    out = repair_travel_start_boost(out, builder, repair_actions)
+    out = repair_deretract(out, repair_actions)
     out = repair_stale_layer_wipe(out, repair_actions)
     out = repair_stale_layer_gap(out, repair_actions)
     out = repair_layer_marker(out, builder, repair_actions, cfg)
@@ -2808,7 +2805,7 @@ def run_postprocess(paths: list[Path], quiet: bool = False, force: bool = False,
     return PostProcessApp().run(paths, quiet, force, argv)
 
 if __name__ == "__main__":
-    argv = sys.argv[1:]
-    force = "--force" in argv or "-f" in argv
-    paths = [Path(p) for p in argv if not p.startswith("-")]
-    sys.exit(PostProcessApp().run(paths, quiet=True, force=force, argv=argv))
+    cli_argv = sys.argv[1:]
+    cli_force = "--force" in cli_argv or "-f" in cli_argv
+    cli_paths = [Path(p) for p in cli_argv if not p.startswith("-")]
+    sys.exit(PostProcessApp().run(cli_paths, quiet=True, force=cli_force, argv=cli_argv))
