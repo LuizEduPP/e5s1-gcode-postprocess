@@ -53,6 +53,13 @@ PRUSA_CONFIG_SCAN_BYTES = 512 * 1024
 
 PRUSA_CONFIG_BEGIN = "; prusaslicer_config = begin"
 PRUSA_CONFIG_END = "; prusaslicer_config = end"
+_PRINT_BODY_END_MARKERS = (
+    "; filament-specific end gcode",
+    ";end gcode for filament",
+    PRUSA_CONFIG_BEGIN,
+    "; objects_info =",
+    "; filament used ",
+)
 PRUSA_KEY_IRONING = "ironing"
 PRUSA_KEY_TOP_SOLID_INFILL_PATTERN = "top_solid_infill_pattern"
 PRUSA_KEY_LAYER_HEIGHT = "layer_height"
@@ -572,6 +579,24 @@ def _has_retract_between(lines: list[str], start: int, end: int) -> bool:
         if "postprocess travel retract" in low or "postprocess layer retract" in low:
             return True
     return False
+
+def _is_gcode_motion_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith(";"):
+        return False
+    return stripped.upper().startswith(("G0", "G1", "G2", "G3"))
+
+def _print_body_end(lines: list[str]) -> int:
+    for i, line in enumerate(lines):
+        if PRUSA_CONFIG_BEGIN in line:
+            return i
+        low = line.lower()
+        for marker in _PRINT_BODY_END_MARKERS:
+            if marker == PRUSA_CONFIG_BEGIN:
+                continue
+            if marker in low:
+                return i
+    return len(lines)
 
 def _coast_travel_body_start(lines: list[str]) -> int:
     for i, line in enumerate(lines):
@@ -1623,17 +1648,18 @@ def repair_coast(lines: list[str], actions: list[str]) -> list[str]:
 def repair_travel_coast(lines: list[str], actions: list[str]) -> list[str]:
     out = list(lines)
     body_start = _coast_travel_body_start(out)
+    body_end = _print_body_end(out)
     last_x, last_y = None, None
     last_ext_i: int | None = None
     coasted = 0
-    for i in range(body_start, len(out)):
+    for i in range(body_start, body_end):
         line = out[i]
         if any(m in line for m in LAYER_MARKERS):
             last_ext_i = None
             continue
-        upper = line.strip().upper()
-        if not upper.startswith(("G0", "G1", "G2", "G3")):
+        if not _is_gcode_motion_line(line):
             continue
+        upper = line.strip().upper()
         low = line.lower()
         if "postprocess purge" in low or PP_SKIRT in low:
             continue
@@ -1671,16 +1697,19 @@ def repair_travel_retract(
 ) -> list[str]:
     out = list(lines)
     body_start = _coast_travel_body_start(out)
+    body_end = _print_body_end(out)
     last_x, last_y = None, None
     last_ext_i: int | None = None
     retracted = 0
-    for i in range(body_start, len(out)):
+    for i in range(body_start, body_end):
         line = out[i]
         low = line.lower()
         if "postprocess purge" in low or PP_SKIRT in low:
             continue
         if any(m in line for m in LAYER_MARKERS):
             last_ext_i = None
+            continue
+        if not _is_gcode_motion_line(line):
             continue
         upper = line.strip().upper()
         m_e = E_VAL_RE.search(upper)
@@ -1697,6 +1726,9 @@ def repair_travel_retract(
                 last_ext_i = None
                 continue
             if _has_retract_between(out, last_ext_i, i):
+                last_ext_i = None
+                continue
+            if _wall_travel_target(out, i):
                 last_ext_i = None
                 continue
             if "postprocess coast" not in out[last_ext_i]:
@@ -1746,9 +1778,10 @@ def repair_travel_start_boost(
 ) -> list[str]:
     out = list(lines)
     body_start = _coast_travel_body_start(out)
+    body_end = _print_body_end(out)
     boosted = 0
     i = body_start
-    while i < len(out):
+    while i < body_end:
         line = out[i]
         low = line.lower()
         if any(m in line for m in LAYER_MARKERS):
@@ -1775,13 +1808,16 @@ def repair_travel_start_boost(
                for k in range(max(i - 3, 0), i)):
             i += 1
             continue
+        if _near_layer_start(out, i) or _active_wall_feature(out, i):
+            i += 1
+            continue
         out.insert(i, builder.flow_boost(TRAVEL_START_BOOST_PCT, "travel start boost"))
         boosted += 1
         i += 1
         remain = TRAVEL_START_BOOST_MM
         lx, ly = None, None
         boost_end = i - 1
-        while i < len(out) and remain > 0:
+        while i < body_end and remain > 0:
             cur = out[i]
             if any(m in cur for m in LAYER_MARKERS):
                 break
@@ -1819,6 +1855,36 @@ def _e_only_positive(line: str) -> float | None:
     if X_VAL_RE.search(stripped) or Y_VAL_RE.search(stripped) or Z_VAL_RE.search(stripped):
         return None
     return e_val
+
+def _near_layer_start(lines: list[str], idx: int, lookback: int = 16) -> bool:
+    for j in range(idx - 1, max(idx - lookback, -1), -1):
+        if AFTER_LAYER_MARKER in lines[j] or LAYER_CHANGE_MARKER in lines[j]:
+            return True
+        if LAYER_BEFORE_MARKER in lines[j]:
+            return False
+    return False
+
+def _active_wall_feature(lines: list[str], idx: int, lookback: int = 12) -> bool:
+    for j in range(idx - 1, max(idx - lookback, -1), -1):
+        feat = type_feature(lines[j])
+        if feat in FEAT_SEAM:
+            return True
+        if feat is not None and feat not in FEAT_SEAM:
+            return False
+    return False
+
+def _wall_travel_target(lines: list[str], travel_i: int, lookahead: int = 16) -> bool:
+    for j in range(travel_i + 1, min(travel_i + lookahead, len(lines))):
+        if any(m in lines[j] for m in LAYER_MARKERS):
+            return False
+        if type_feature(lines[j]) in FEAT_SEAM:
+            return True
+        stripped = lines[j].strip()
+        if G1_EXTRUDE_RE.match(stripped):
+            m = E_VAL_RE.search(stripped.upper())
+            if m and float(m.group(1)) > COAST_MIN_REMAIN_E_MM:
+                return _active_wall_feature(lines, j)
+    return False
 
 def _after_slicer_wipe(lines: list[str], idx: int, lookback: int = 16) -> bool:
     for j in range(idx - 1, max(idx - lookback, -1), -1):
@@ -1895,8 +1961,11 @@ def repair_deretract(lines: list[str], profile: E5S1Profile, builder: GCodeBuild
                 if _slow_deretract_line(out, j, profile, builder, max_e=DERETRACT_MAX_E_MM):
                     slowed += 1
                 break
-        elif (_after_slicer_wipe(out, i) or _after_layer_travel(out, i)
-                or _travel_mm_before_extrusion(out, i) >= TRAVEL_COAST_MIN_MM) and _slow_deretract_line(
+        elif ((_after_slicer_wipe(out, i)
+                or (_travel_mm_before_extrusion(out, i) >= TRAVEL_COAST_MIN_MM
+                    and not _active_wall_feature(out, i)))
+                and not _after_layer_travel(out, i)
+                and not _near_layer_start(out, i)) and _slow_deretract_line(
             out, i, profile, builder, max_e=SLICER_DERETRACT_MAX_E_MM,
         ):
             slowed += 1
@@ -2330,16 +2399,6 @@ def transform_layer_boundary(ctx: TransformContext, lines: list[str], idx: int) 
             ctx.begin_layer(ctx.current_line)
         else:
             ctx.out.append(ctx.current_line)
-            if LAYER_RETRACT and ctx.layer_count >= 1 and not recent_retract(ctx.out):
-                before_idx = _next_marker_idx(lines, idx, LAYER_BEFORE_MARKER)
-                if before_idx is None or not _slicer_prep_between(lines, idx, before_idx):
-                    seam_extra = ctx.surface_kind in FEAT_SEAM
-                    ctx.out.extend(layer_retract_lines(
-                        ctx.profile, ctx.builder, seam_extra=seam_extra, last_x=ctx.last_x, last_y=ctx.last_y,
-                    ))
-                    ctx.actions.append("retract_layer")
-                    if seam_extra and ctx.profile["seam_extra_retract"] > 0:
-                        ctx.actions.append("seam_extra_retract")
         return True
     return False
 
