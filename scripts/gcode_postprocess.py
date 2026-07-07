@@ -14,8 +14,29 @@ import re
 import sys
 import time
 
-PROJECT = Path(__file__).resolve().parent.parent
-LOG_DIR = PROJECT / "logs"
+_SCRIPT_PATH = Path(__file__).resolve()
+SCRIPT_DIR = _SCRIPT_PATH.parent
+ENV_GCODE_LOG_DIR = "GCODE_POSTPROCESS_LOG_DIR"
+
+
+def _resolve_project_root() -> Path:
+    """Repo root when script lives in scripts/; otherwise the folder containing the script."""
+    if SCRIPT_DIR.name == "scripts":
+        repo_root = SCRIPT_DIR.parent
+        if (repo_root / "scripts" / _SCRIPT_PATH.name).resolve() == _SCRIPT_PATH:
+            return repo_root
+    return SCRIPT_DIR
+
+
+def _resolve_log_dir(project_root: Path) -> Path:
+    override = os.environ.get(ENV_GCODE_LOG_DIR, "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return project_root / "logs"
+
+
+PROJECT = _resolve_project_root()
+LOG_DIR = _resolve_log_dir(PROJECT)
 STATE_FILE = LOG_DIR / "e5s1_state.json"
 LOG_FILE = LOG_DIR / "e5s1_events.log"
 
@@ -3171,7 +3192,7 @@ class StateLogger:
         self._ensure_log_dir()
 
     def _ensure_log_dir(self) -> None:
-        LOG_DIR.mkdir(exist_ok=True)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     def log(self, event: str, message: str = "", echo: bool = True) -> None:
         self._ensure_log_dir()
@@ -3305,6 +3326,9 @@ class PostProcessApp:
             try:
                 state_data = {
                     **{k: v for k, v in result_analysis.items() if v is not None and k != "large"},
+                    "printer": printer_id,
+                    "script": str(_SCRIPT_PATH),
+                    "log_dir": str(LOG_DIR),
                     "last_path": str(path),
                     "last_export": str(export or "")
                 }

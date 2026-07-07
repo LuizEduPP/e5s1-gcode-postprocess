@@ -40,6 +40,37 @@ GCODE_PRINTER=e3pro python3 /absolute/path/to/scripts/gcode_postprocess.py
 
 Use the **absolute** path to `gcode_postprocess.py`. PrusaSlicer appends the `.gcode` file path as the last argument automatically — do **not** add the file path or extra flags in that field.
 
+### Windows (PrusaSlicer)
+
+On Windows, **do not** point post-processing at the `.py` file alone — PrusaSlicer will try to run it as an executable and fail with **Win32 error 193**. Also avoid `python3` (often missing) and Linux-only syntax like `GCODE_PRINTER=e3pro python3 ...`.
+
+1. Copy `scripts/gcode_postprocess.py` and the matching `.bat` wrapper to the same folder (e.g. `C:\Users\Pichau\Documents\`).
+2. Install [Python 3.11+](https://www.python.org/downloads/) and tick **“Add python.exe to PATH”**.
+3. In PrusaSlicer → **Print Settings → Output options → Post-processing scripts**, use the **full path to the `.bat`**:
+
+**E5S1:**
+
+```ini
+C:\Users\Pichau\Documents\gcode_postprocess_e5s1.bat
+```
+
+**E3 Pro:**
+
+```ini
+C:\Users\Pichau\Documents\gcode_postprocess_e3pro.bat
+```
+
+Test in `cmd`:
+
+```bat
+py -3 C:\Users\Pichau\Documents\gcode_postprocess.py
+C:\Users\Pichau\Documents\gcode_postprocess_e5s1.bat C:\path\to\test.gcode
+```
+
+If `py` is not found, use `python` instead (the `.bat` tries both).
+
+**Logs (standalone copy):** with only `gcode_postprocess.py` in e.g. `C:\Users\Pichau\Documents\`, logs are written to `C:\Users\Pichau\Documents\logs\` (`e5s1_events.log`, `e5s1_state.json`). No repo folder required.
+
 **Important:** the in-slicer G-code preview shows the file **before** post-processing ([official docs](https://help.prusa3d.com/article/post-processing-scripts_283913)). To verify processing, open the exported `.gcode` (Downloads, SD card, etc.) in a text editor: line 3 should be `; --- E5S1 postprocess ---` or `; --- E3PRO postprocess ---` depending on the preset.
 
 ## Environment variables
@@ -47,6 +78,7 @@ Use the **absolute** path to `gcode_postprocess.py`. PrusaSlicer appends the `.g
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `GCODE_PRINTER` | No | Printer preset: `e5s1` (default), `e3pro` / `ender3pro` |
+| `GCODE_POSTPROCESS_LOG_DIR` | No | Override log folder (default: `logs/` beside script, or repo `logs/` in dev) |
 | `E5S1_EXPORT_DIR` | No | Extra folder to search for recent post-processed exports (default: `~/Downloads`) |
 
 ## Tuning
