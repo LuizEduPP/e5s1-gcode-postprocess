@@ -36,7 +36,7 @@ Use the **absolute** path to `gcode_postprocess.py`. PrusaSlicer appends the `.g
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `E5S1_EXPORT_DIR` | No | Extra folder to search for recent post-processed exports (default: `~/Downloads`, `~/Documents`, `~/Documentos`) |
+| `E5S1_EXPORT_DIR` | No | Extra folder to search for recent post-processed exports (default: `~/Downloads`) |
 
 ## Tuning
 
