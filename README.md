@@ -127,20 +127,21 @@ Calibrated for **Ender-5 S1 + 0.8 mm nozzle** (constants in `gcode_postprocess.p
 | Nozzle | 0.8 mm (high-flow / Spider) |
 | Build volume margins (skirt) | 2–218 mm (X/Y) |
 | First layer height (profile default) | 0.24 mm |
-| Fan off layers | 2 |
-| Full fan layer | 5 |
-| Pressure advance (`PA_K`) | 0.03 |
-| Max volumetric flow | 24 mm³/s |
-| Wall / infill speed cap | 38 / 75 mm/s |
-| Early-layer extrusion cap (layers 2–3) | 25 mm/s |
-| Travel speed cap | 40 mm/s |
-| First-layer print speed | 20 mm/s |
-| Flow ramp (layers 1–4) | 100%, 93%, 92%, 96% |
-| Layer accel (layers 1–3 / 4+) | 500 / 2000 mm/s² (`M204 P`) |
-| Retraction | 1.2 mm @ 45 mm/s, Z-hop 0.4 mm |
+| Fan off layers | 1 |
+| Full fan layer | 4 |
+| Pressure advance (`PA_K`) | 0.034 |
+| Max volumetric flow | 28 mm³/s |
+| External / internal wall cap | 46 / 54 mm/s |
+| Infill speed cap | 92 mm/s |
+| Early-layer extrusion cap (layer 2) | 34 mm/s |
+| Travel speed cap | 130 mm/s |
+| First-layer print speed | 24 mm/s |
+| Flow ramp (layers 1–4) | 100%, 97%, 98%, 100% |
+| Layer accel (layers 1–3 / 4+) | 800 / 3500 mm/s² (`M204 P`) |
+| Retraction | 1.2 mm @ 50 mm/s, Z-hop 0.4 mm |
 | Skirt (if injected) | 3 loops, 40 mm side, origin (3, 3) mm |
 | Small-part skirt offset | 2.5 mm (bbox &lt; 45 mm) |
-| Seam flow / join speed | 96% at join (last 1.5 mm) / 18 mm/s close cap |
+| Seam flow / join speed | 96% at join (last 1.5 mm) / 24 mm/s close cap |
 | Mesh on start (if injected) | `M420 S1` + `M420 Z10` fade |
 
 ## License

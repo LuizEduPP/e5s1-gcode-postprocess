@@ -117,7 +117,7 @@ OVERHANG_FAN_SKIP_THRESHOLD = 40
 LARGE_EXTRUDE_LINE_ESTIMATE_MULT = 50
 
 SMALL_PERIMETER_THRESHOLD_MM = 20.0
-SMALL_PERIMETER_SPEED_CAP_F = 900
+SMALL_PERIMETER_SPEED_CAP_F = 1500
 LOOP_CLOSE_TOL_MM = 0.05
 SEAM_JOIN_FLOW_MM = 1.5
 
@@ -137,7 +137,7 @@ FIRST_LAYER_INTERNAL_WALL_FACTOR = 1.15
 FIRST_LAYER_INFILL_FACTOR = 1.2
 
 PA_FIRMWARE = "marlin"
-PA_K = 0.03
+PA_K = 0.034
 PA_INFILL_SCALE = 1.2
 PA_PERIMETER_SCALE = 0.9
 PA_BRIDGE_SCALE = 0.5
@@ -150,13 +150,13 @@ MM_S_TO_F = 60
 NOZZLE_DIAMETER_MM = 0.8
 LAYER_HEIGHT_FIRST_MM = 0.24
 TEMP_FIRST_LAYER_C = "215"
-MAX_VOLUMETRIC_FLOW_MM3_S = 24.0
+MAX_VOLUMETRIC_FLOW_MM3_S = 28.0
 
 RETRACT_LENGTH_MM = 1.2
-RETRACT_SPEED_MM_S = 45.0
+RETRACT_SPEED_MM_S = 50.0
 RETRACT_LIFT_MM = 0.4
 
-FAN_OFF_LAYERS = 2
+FAN_OFF_LAYERS = 1
 FAN_RAMP_LAYERS = 2
 FAN_FULL_LAYER = FAN_OFF_LAYERS + FAN_RAMP_LAYERS + 1
 FAN_MIN_PCT = 80
@@ -168,24 +168,25 @@ FAN_IRONING_PCT = 35
 FAN_INTERFACE_PCT = 78
 FAN_SUPPORT_PCT = 78
 
-FLOW_RAMP = (100, 93, 92, 96)
+FLOW_RAMP = (100, 97, 98, 100)
 FLOW_BRIDGE_PCT = 95
-NOZZLE_WALL_MM_S = 38
-NOZZLE_INFILL_MM_S = 75
-NOZZLE_CAP_MM_S = 25
-NOZZLE_TRAVEL_MM_S = 40
-SPEED_FIRST_LAYER_MM_S = 20.0
+NOZZLE_EXTERNAL_MM_S = 46
+NOZZLE_WALL_MM_S = 54
+NOZZLE_INFILL_MM_S = 92
+NOZZLE_CAP_MM_S = 34
+NOZZLE_TRAVEL_MM_S = 130
+SPEED_FIRST_LAYER_MM_S = 24.0
 SPEED_MAX_PRINT_MM_S = 250.0
 
-ACCEL_FIRST_LAYER = 500
-ACCEL_DEFAULT = 2000
-LAYER_CAP_EXTRUSION = 3
+ACCEL_FIRST_LAYER = 800
+ACCEL_DEFAULT = 3500
+LAYER_CAP_EXTRUSION = 2
 LAYER_FIRST_MOTION = 3
 
 SEAM_EXTRA_RETRACT_MM = 0.4
 SEAM_FLOW_PCT = 96
 SEAM_FAN_PCT = 85
-SEAM_JOIN_SPEED_MM_S = 18.0
+SEAM_JOIN_SPEED_MM_S = 24.0
 
 SKIRT_LOOPS = 3
 SKIRT_SIDE_MM = 40.0
@@ -268,6 +269,7 @@ class E5S1Profile(TypedDict):
     seam_join_f: int
     first_layer_f: int
     wall_early_f: int
+    external_wall_f: int
     max_infill_f: int
     cap_extrusion_f: int
     max_print_f: int
@@ -422,6 +424,7 @@ def build_e5s1_profile() -> E5S1Profile:
         "seam_join_f": mm_s_to_f(SEAM_JOIN_SPEED_MM_S),
         "first_layer_f": mm_s_to_f(SPEED_FIRST_LAYER_MM_S),
         "wall_early_f": mm_s_to_f(NOZZLE_WALL_MM_S),
+        "external_wall_f": mm_s_to_f(NOZZLE_EXTERNAL_MM_S),
         "max_infill_f": mm_s_to_f(NOZZLE_INFILL_MM_S),
         "cap_extrusion_f": mm_s_to_f(NOZZLE_CAP_MM_S),
         "max_print_f": mm_s_to_f(SPEED_MAX_PRINT_MM_S),
@@ -1042,18 +1045,20 @@ def speed_cap_for(
             return min(int(profile["first_layer_f"] * FIRST_LAYER_INTERNAL_WALL_FACTOR), ceiling)
         return min(profile["first_layer_f"], ceiling)
     if layer_count <= profile["cap_extrusion_layers"]:
-        if kind in FEAT_WALL:
+        if kind == "external":
+            cap = min(profile["external_wall_f"], ceiling)
+        elif kind in FEAT_WALL:
             cap = min(profile["wall_early_f"], ceiling)
         else:
             cap = min(profile["cap_extrusion_f"], ceiling)
     elif kind in FEAT_INFILL:
         cap = min(profile["max_infill_f"], ceiling)
+    elif kind == "external":
+        cap = min(profile["external_wall_f"], ceiling)
+    elif kind in FEAT_WALL:
+        cap = min(profile["wall_early_f"], ceiling)
     else:
         cap = None
-    if kind in FEAT_WALL_CAP and cap is not None:
-        cap = min(cap, profile["seam_join_f"])
-    elif kind in FEAT_WALL_CAP:
-        cap = profile["seam_join_f"]
     return cap
 
 def layer_retract_lines(
